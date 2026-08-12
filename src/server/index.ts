@@ -6,15 +6,9 @@ import {
 	routePartykitRequest,
 } from "partyserver";
 
-import type {
-	ChatMessage,
-	Message,
-} from "../shared";
+import type { ChatMessage } from "../shared";
 
-
-const ALLOWED_ORIGIN =
-	"https://drkodoom.github.io";
-
+const ALLOWED_ORIGIN = "https://drkodoom.github.io";
 
 type ChatConnectionState = {
 	username: string;
@@ -22,23 +16,17 @@ type ChatConnectionState = {
 	joinedAt: number;
 };
 
-
-// ======================================================
-// DURABLE CHAT ROOM
-// ======================================================
+type ClientMessage =
+	| { type: "add"; id?: string; content?: string }
+	| { type: "ping"; time?: number }
+	| { type: "clear_room" };
 
 export class Chat extends Server<Env> {
+	static options = { hibernate: true };
 
-	static options = {
-		hibernate: true,
-	};
-
-
-	messages = [] as ChatMessage[];
-
+	messages: ChatMessage[] = [];
 
 	onStart() {
-
 		this.ctx.storage.sql.exec(`
 			CREATE TABLE IF NOT EXISTS messages (
 				id TEXT PRIMARY KEY,
@@ -48,337 +36,241 @@ export class Chat extends Server<Env> {
 			)
 		`);
 
-
-		this.messages =
-			this.ctx.storage.sql
-				.exec(`
-					SELECT *
-					FROM messages
-				`)
-				.toArray() as ChatMessage[];
+		this.messages = this.ctx.storage.sql
+			.exec(`SELECT * FROM messages`)
+			.toArray() as ChatMessage[];
 	}
 
+	getOnlineUsers(excludeConnectionId?: string) {
+		const users = new Set<string>();
 
-	// ==================================================
-	// PRESENCE HELPERS
-	// ==================================================
-
-	getOnlineUsers(
-		excludeConnectionId?: string
-	) {
-
-		const users =
-			new Set<string>();
-
-
-		for (
-			const connection
-			of this.getConnections<ChatConnectionState>()
-		) {
-
-			if (
-				excludeConnectionId &&
-				connection.id ===
-					excludeConnectionId
-			) {
+		for (const connection of this.getConnections<ChatConnectionState>()) {
+			if (excludeConnectionId && connection.id === excludeConnectionId) {
 				continue;
 			}
 
-
-			const username =
-				connection.state?.username;
-
+			const username = connection.state?.username;
 
 			if (username) {
 				users.add(username);
 			}
 		}
 
-
-		return Array
-			.from(users)
-			.sort(
-				(a, b) =>
-					a.localeCompare(
-						b,
-						undefined,
-						{
-							sensitivity:
-								"base",
-						}
-					)
-			);
+		return Array.from(users).sort((a, b) =>
+			a.localeCompare(
+				b,
+				undefined,
+				{ sensitivity: "base" },
+			),
+		);
 	}
-
 
 	isUsernameOnline(
 		username: string,
-		excludeConnectionId?: string
+		excludeConnectionId?: string,
 	) {
-
-		for (
-			const connection
-			of this.getConnections<ChatConnectionState>()
-		) {
-
-			if (
-				excludeConnectionId &&
-				connection.id ===
-					excludeConnectionId
-			) {
+		for (const connection of this.getConnections<ChatConnectionState>()) {
+			if (excludeConnectionId && connection.id === excludeConnectionId) {
 				continue;
 			}
 
-
-			if (
-				connection.state?.username ===
-					username
-			) {
+			if (connection.state?.username === username) {
 				return true;
 			}
 		}
 
-
 		return false;
 	}
 
-
-	broadcastPresence(
-		excludeConnectionId?: string
-	) {
-
+	broadcastPresence(excludeConnectionId?: string) {
 		this.broadcast(
 			JSON.stringify({
 				type: "presence",
-
-				users:
-					this.getOnlineUsers(
-						excludeConnectionId
-					),
-			})
+				users: this.getOnlineUsers(
+					excludeConnectionId,
+				),
+			}),
 		);
 	}
 
-
 	broadcastSystem(
 		event: "join" | "leave",
-		username: string
+		username: string,
 	) {
-
 		this.broadcast(
 			JSON.stringify({
 				type: "system",
 				event,
 				username,
-			})
+			}),
 		);
 	}
 
-
-	// ==================================================
-	// CONNECTION OPENED
-	// ==================================================
-
 	onConnect(
 		connection: Connection,
-		context: ConnectionContext
+		context: ConnectionContext,
 	) {
-
 		const username =
 			context.request.headers.get(
-				"x-chat-username"
+				"x-chat-username",
 			);
-
 
 		const role =
 			context.request.headers.get(
-				"x-chat-role"
+				"x-chat-role",
 			) || "user";
 
-
 		if (!username) {
-
 			connection.close(
 				1008,
-				"Unauthorized"
+				"Unauthorized",
 			);
 
 			return;
 		}
-
-
-		/*
-		 * Check BEFORE assigning this
-		 * connection's state so opening
-		 * another tab does not make the
-		 * same username "join" twice.
-		 */
 
 		const alreadyOnline =
 			this.isUsernameOnline(
 				username,
-				connection.id
+				connection.id,
 			);
-
 
 		connection.setState({
 			username,
 			role,
-			joinedAt:
-				Date.now(),
+			joinedAt: Date.now(),
 		});
-
-
-		/*
-		 * Send message history to the
-		 * person who just connected.
-		 */
 
 		connection.send(
 			JSON.stringify({
 				type: "all",
-				messages:
-					this.messages,
-			} satisfies Message)
+				messages: this.messages,
+			}),
 		);
 
-
-		/*
-		 * Announce a user only when
-		 * their FIRST connection joins.
-		 */
-
 		if (!alreadyOnline) {
-
 			this.broadcastSystem(
 				"join",
-				username
+				username,
 			);
 		}
-
 
 		this.broadcastPresence();
 	}
 
-
-	// ==================================================
-	// CONNECTION CLOSED
-	// ==================================================
-
-	onClose(
-		connection: Connection
-	) {
-
+	onClose(connection: Connection) {
 		const state =
 			connection.state as
 				ChatConnectionState | null;
 
-
 		const username =
 			state?.username;
-
 
 		if (!username) {
 			return;
 		}
-
-
-		/*
-		 * Ignore this closing connection
-		 * when checking whether the same
-		 * username is still connected in
-		 * another tab/device.
-		 */
 
 		const stillOnline =
 			this.isUsernameOnline(
 				username,
-				connection.id
+				connection.id,
 			);
 
-
 		if (!stillOnline) {
-
 			this.broadcastSystem(
 				"leave",
-				username
+				username,
 			);
 		}
 
-
 		this.broadcastPresence(
-			connection.id
+			connection.id,
 		);
 	}
 
-
-	// ==================================================
-	// CHAT MESSAGE
-	// ==================================================
-
 	onMessage(
 		connection: Connection,
-		message: WSMessage
+		message: WSMessage,
 	) {
-
-		if (
-			typeof message !==
-				"string"
-		) {
+		if (typeof message !== "string") {
 			return;
 		}
 
-
-		let parsed: Message;
-
+		let parsed: ClientMessage;
 
 		try {
-
 			parsed =
 				JSON.parse(
-					message
-				) as Message;
-
+					message,
+				) as ClientMessage;
 		} catch {
-
 			return;
 		}
-
-
-		if (
-			parsed.type !== "add"
-		) {
-			return;
-		}
-
 
 		const state =
 			connection.state as
 				ChatConnectionState | null;
 
-
-		const username =
-			state?.username;
-
-
-		if (!username) {
+		if (!state?.username) {
 			return;
 		}
 
+		// Heartbeat
+		if (parsed.type === "ping") {
+			connection.send(
+				JSON.stringify({
+					type: "pong",
+					time: Date.now(),
+				}),
+			);
+
+			return;
+		}
+
+		// Admin-only permanent room clear
+		if (parsed.type === "clear_room") {
+			if (state.role !== "admin") {
+				connection.send(
+					JSON.stringify({
+						type: "error",
+						message:
+							"Administrator access required.",
+					}),
+				);
+
+				return;
+			}
+
+			this.ctx.storage.sql.exec(`
+				DELETE FROM messages
+			`);
+
+			this.messages = [];
+
+			this.broadcast(
+				JSON.stringify({
+					type: "clear_room",
+					username:
+						state.username,
+				}),
+			);
+
+			return;
+		}
+
+		if (parsed.type !== "add") {
+			return;
+		}
 
 		const id =
 			String(
-				parsed.id || ""
-			)
-				.trim();
-
+				parsed.id || "",
+			).trim();
 
 		const content =
 			String(
-				parsed.content || ""
-			)
-				.trim();
-
+				parsed.content || "",
+			).trim();
 
 		if (
 			!/^[A-Za-z0-9_-]{1,64}$/
@@ -387,7 +279,6 @@ export class Chat extends Server<Env> {
 			return;
 		}
 
-
 		if (
 			content.length < 1 ||
 			content.length > 1000
@@ -395,45 +286,28 @@ export class Chat extends Server<Env> {
 			return;
 		}
 
-
-		const existing =
-			this.messages.find(
-				item =>
-					item.id === id
-			);
-
-
-		if (existing) {
+		if (
+			this.messages.some(
+				(item) =>
+					item.id === id,
+			)
+		) {
 			return;
 		}
 
-
 		const cleanMessage:
 			ChatMessage = {
-
-			id,
-
-			content,
-
-			/*
-			 * IMPORTANT:
-			 * Username comes from the
-			 * authenticated connection,
-			 * NOT from client JSON.
-			 */
-
-			user:
-				username,
-
-			role:
-				"user",
-		};
-
+				id,
+				content,
+				user:
+					state.username,
+				role:
+					"user",
+			};
 
 		this.messages.push(
-			cleanMessage
+			cleanMessage,
 		);
-
 
 		this.ctx.storage.sql.exec(
 			`
@@ -456,39 +330,23 @@ export class Chat extends Server<Env> {
 			cleanMessage.id,
 			cleanMessage.user,
 			cleanMessage.role,
-			cleanMessage.content
+			cleanMessage.content,
 		);
 
-
-		const outgoing:
-			Message = {
-
-			type: "add",
-
-			...cleanMessage,
-		};
-
-
 		this.broadcast(
-			JSON.stringify(
-				outgoing
-			)
+			JSON.stringify({
+				type: "add",
+				...cleanMessage,
+			}),
 		);
 	}
 }
 
-
-// ======================================================
-// WORKER
-// ======================================================
-
 export default {
-
 	async fetch(
 		request: Request,
-		env: Env
+		env: Env,
 	) {
-
 		const routed =
 			await routePartykitRequest(
 				request,
@@ -499,84 +357,55 @@ export default {
 					onBeforeConnect:
 						async (
 							req,
-							lobby
+							lobby,
 						) => {
-
-							/*
-							 * Only ONE shared room.
-							 */
-
 							if (
 								lobby.name !==
-									"lobby"
+								"lobby"
 							) {
-
 								return new Response(
 									"Room not found.",
 									{
-										status:
-											404,
-									}
+										status: 404,
+									},
 								);
 							}
-
-
-							/*
-							 * Connections must
-							 * originate from your
-							 * GitHub Pages site.
-							 */
 
 							const origin =
 								req.headers.get(
-									"Origin"
+									"Origin",
 								);
-
 
 							if (
 								origin !==
-									ALLOWED_ORIGIN
+								ALLOWED_ORIGIN
 							) {
-
 								return new Response(
 									"Forbidden.",
 									{
-										status:
-											403,
-									}
+										status: 403,
+									},
 								);
 							}
-
 
 							const url =
 								new URL(
-									req.url
+									req.url,
 								);
-
 
 							const token =
 								url.searchParams.get(
-									"token"
+									"token",
 								);
 
-
 							if (!token) {
-
 								return new Response(
 									"Login required.",
 									{
-										status:
-											401,
-									}
+										status: 401,
+									},
 								);
 							}
-
-
-							/*
-							 * Ask the existing
-							 * authentication Worker
-							 * who this person is.
-							 */
 
 							const authResponse =
 								await env.AUTH.fetch(
@@ -590,104 +419,83 @@ export default {
 												Authorization:
 													`Bearer ${token}`,
 											},
-										}
-									)
+										},
+									),
 								);
-
 
 							if (
 								!authResponse.ok
 							) {
-
 								return new Response(
 									"Invalid session.",
 									{
-										status:
-											401,
-									}
+										status: 401,
+									},
 								);
 							}
 
-
 							const authData =
-								await authResponse
-									.json() as {
+								(await authResponse.json()) as {
+									ok?: boolean;
 
-								ok?: boolean;
+									user?: {
+										username?:
+											string;
 
-								user?: {
-									username?:
-										string;
-
-									role?:
-										string;
+										role?:
+											string;
+									};
 								};
-							};
-
 
 							if (
 								!authData.ok ||
 								!authData.user
 									?.username
 							) {
-
 								return new Response(
 									"Invalid session.",
 									{
-										status:
-											401,
-									}
+										status: 401,
+									},
 								);
 							}
 
-
-							/*
-							 * Never pass the session
-							 * token into the Durable
-							 * Object itself.
-							 */
-
+							// Never forward session token
+							// into the Durable Object.
 							url.searchParams.delete(
-								"token"
+								"token",
 							);
-
 
 							const forwarded =
 								new Request(
 									url.toString(),
-									req
+									req,
 								);
-
 
 							forwarded.headers.set(
 								"x-chat-username",
 								authData.user
-									.username
+									.username,
 							);
-
 
 							forwarded.headers.set(
 								"x-chat-role",
 								authData.user
 									.role ||
-									"user"
+									"user",
 							);
-
 
 							return forwarded;
 						},
-				}
+				},
 			);
-
 
 		if (routed) {
 			return routed;
 		}
 
-
 		return env.ASSETS.fetch(
-			request
+			request,
 		);
 	},
-
 } satisfies ExportedHandler<Env>;
