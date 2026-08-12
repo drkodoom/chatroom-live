@@ -6,9 +6,21 @@ import {
 	routePartykitRequest,
 } from "partyserver";
 
-import type { ChatMessage, Message } from "../shared";
+import type {
+	ChatMessage,
+	Message,
+} from "../shared";
 
-const ALLOWED_ORIGIN = "https://drkodoom.github.io";
+
+const ALLOWED_ORIGIN =
+	"https://drkodoom.github.io";
+
+
+type ChatConnectionState = {
+	username: string;
+	role: string;
+	joinedAt: number;
+};
 
 
 // ======================================================
@@ -16,14 +28,17 @@ const ALLOWED_ORIGIN = "https://drkodoom.github.io";
 // ======================================================
 
 export class Chat extends Server<Env> {
+
 	static options = {
 		hibernate: true,
 	};
+
 
 	messages = [] as ChatMessage[];
 
 
 	onStart() {
+
 		this.ctx.storage.sql.exec(`
 			CREATE TABLE IF NOT EXISTS messages (
 				id TEXT PRIMARY KEY,
@@ -32,6 +47,7 @@ export class Chat extends Server<Env> {
 				content TEXT
 			)
 		`);
+
 
 		this.messages =
 			this.ctx.storage.sql
@@ -43,14 +59,136 @@ export class Chat extends Server<Env> {
 	}
 
 
+	// ==================================================
+	// PRESENCE HELPERS
+	// ==================================================
+
+	getOnlineUsers(
+		excludeConnectionId?: string
+	) {
+
+		const users =
+			new Set<string>();
+
+
+		for (
+			const connection
+			of this.getConnections<ChatConnectionState>()
+		) {
+
+			if (
+				excludeConnectionId &&
+				connection.id ===
+					excludeConnectionId
+			) {
+				continue;
+			}
+
+
+			const username =
+				connection.state?.username;
+
+
+			if (username) {
+				users.add(username);
+			}
+		}
+
+
+		return Array
+			.from(users)
+			.sort(
+				(a, b) =>
+					a.localeCompare(
+						b,
+						undefined,
+						{
+							sensitivity:
+								"base",
+						}
+					)
+			);
+	}
+
+
+	isUsernameOnline(
+		username: string,
+		excludeConnectionId?: string
+	) {
+
+		for (
+			const connection
+			of this.getConnections<ChatConnectionState>()
+		) {
+
+			if (
+				excludeConnectionId &&
+				connection.id ===
+					excludeConnectionId
+			) {
+				continue;
+			}
+
+
+			if (
+				connection.state?.username ===
+					username
+			) {
+				return true;
+			}
+		}
+
+
+		return false;
+	}
+
+
+	broadcastPresence(
+		excludeConnectionId?: string
+	) {
+
+		this.broadcast(
+			JSON.stringify({
+				type: "presence",
+
+				users:
+					this.getOnlineUsers(
+						excludeConnectionId
+					),
+			})
+		);
+	}
+
+
+	broadcastSystem(
+		event: "join" | "leave",
+		username: string
+	) {
+
+		this.broadcast(
+			JSON.stringify({
+				type: "system",
+				event,
+				username,
+			})
+		);
+	}
+
+
+	// ==================================================
+	// CONNECTION OPENED
+	// ==================================================
+
 	onConnect(
 		connection: Connection,
 		context: ConnectionContext
 	) {
+
 		const username =
 			context.request.headers.get(
 				"x-chat-username"
 			);
+
 
 		const role =
 			context.request.headers.get(
@@ -59,6 +197,7 @@ export class Chat extends Server<Env> {
 
 
 		if (!username) {
+
 			connection.close(
 				1008,
 				"Unauthorized"
@@ -68,27 +207,123 @@ export class Chat extends Server<Env> {
 		}
 
 
+		/*
+		 * Check BEFORE assigning this
+		 * connection's state so opening
+		 * another tab does not make the
+		 * same username "join" twice.
+		 */
+
+		const alreadyOnline =
+			this.isUsernameOnline(
+				username,
+				connection.id
+			);
+
+
 		connection.setState({
 			username,
 			role,
+			joinedAt:
+				Date.now(),
 		});
 
+
+		/*
+		 * Send message history to the
+		 * person who just connected.
+		 */
 
 		connection.send(
 			JSON.stringify({
 				type: "all",
-				messages: this.messages,
+				messages:
+					this.messages,
 			} satisfies Message)
+		);
+
+
+		/*
+		 * Announce a user only when
+		 * their FIRST connection joins.
+		 */
+
+		if (!alreadyOnline) {
+
+			this.broadcastSystem(
+				"join",
+				username
+			);
+		}
+
+
+		this.broadcastPresence();
+	}
+
+
+	// ==================================================
+	// CONNECTION CLOSED
+	// ==================================================
+
+	onClose(
+		connection: Connection
+	) {
+
+		const state =
+			connection.state as
+				ChatConnectionState | null;
+
+
+		const username =
+			state?.username;
+
+
+		if (!username) {
+			return;
+		}
+
+
+		/*
+		 * Ignore this closing connection
+		 * when checking whether the same
+		 * username is still connected in
+		 * another tab/device.
+		 */
+
+		const stillOnline =
+			this.isUsernameOnline(
+				username,
+				connection.id
+			);
+
+
+		if (!stillOnline) {
+
+			this.broadcastSystem(
+				"leave",
+				username
+			);
+		}
+
+
+		this.broadcastPresence(
+			connection.id
 		);
 	}
 
+
+	// ==================================================
+	// CHAT MESSAGE
+	// ==================================================
 
 	onMessage(
 		connection: Connection,
 		message: WSMessage
 	) {
+
 		if (
-			typeof message !== "string"
+			typeof message !==
+				"string"
 		) {
 			return;
 		}
@@ -96,15 +331,20 @@ export class Chat extends Server<Env> {
 
 		let parsed: Message;
 
+
 		try {
+
 			parsed =
-				JSON.parse(message) as Message;
+				JSON.parse(
+					message
+				) as Message;
+
 		} catch {
+
 			return;
 		}
 
 
-		// For now we only permit new messages.
 		if (
 			parsed.type !== "add"
 		) {
@@ -113,10 +353,8 @@ export class Chat extends Server<Env> {
 
 
 		const state =
-			connection.state as {
-				username?: string;
-				role?: string;
-			} | null;
+			connection.state as
+				ChatConnectionState | null;
 
 
 		const username =
@@ -129,17 +367,22 @@ export class Chat extends Server<Env> {
 
 
 		const id =
-			String(parsed.id || "")
+			String(
+				parsed.id || ""
+			)
 				.trim();
 
 
 		const content =
-			String(parsed.content || "")
+			String(
+				parsed.content || ""
+			)
 				.trim();
 
 
 		if (
-			!/^[A-Za-z0-9_-]{1,64}$/.test(id)
+			!/^[A-Za-z0-9_-]{1,64}$/
+				.test(id)
 		) {
 			return;
 		}
@@ -153,11 +396,10 @@ export class Chat extends Server<Env> {
 		}
 
 
-		// Don't allow somebody to overwrite
-		// another existing message.
 		const existing =
 			this.messages.find(
-				item => item.id === id
+				item =>
+					item.id === id
 			);
 
 
@@ -166,11 +408,25 @@ export class Chat extends Server<Env> {
 		}
 
 
-		const cleanMessage: ChatMessage = {
+		const cleanMessage:
+			ChatMessage = {
+
 			id,
+
 			content,
-			user: username,
-			role: "user",
+
+			/*
+			 * IMPORTANT:
+			 * Username comes from the
+			 * authenticated connection,
+			 * NOT from client JSON.
+			 */
+
+			user:
+				username,
+
+			role:
+				"user",
 		};
 
 
@@ -182,9 +438,20 @@ export class Chat extends Server<Env> {
 		this.ctx.storage.sql.exec(
 			`
 				INSERT INTO messages
-				(id, user, role, content)
+				(
+					id,
+					user,
+					role,
+					content
+				)
 
-				VALUES (?, ?, ?, ?)
+				VALUES
+				(
+					?,
+					?,
+					?,
+					?
+				)
 			`,
 			cleanMessage.id,
 			cleanMessage.user,
@@ -193,14 +460,19 @@ export class Chat extends Server<Env> {
 		);
 
 
-		const outgoing: Message = {
+		const outgoing:
+			Message = {
+
 			type: "add",
+
 			...cleanMessage,
 		};
 
 
 		this.broadcast(
-			JSON.stringify(outgoing)
+			JSON.stringify(
+				outgoing
+			)
 		);
 	}
 }
@@ -211,14 +483,18 @@ export class Chat extends Server<Env> {
 // ======================================================
 
 export default {
+
 	async fetch(
 		request: Request,
 		env: Env
 	) {
+
 		const routed =
 			await routePartykitRequest(
 				request,
-				{ ...env },
+				{
+					...env,
+				},
 				{
 					onBeforeConnect:
 						async (
@@ -226,22 +502,31 @@ export default {
 							lobby
 						) => {
 
-							// Everyone uses ONE room.
+							/*
+							 * Only ONE shared room.
+							 */
+
 							if (
 								lobby.name !==
-								"lobby"
+									"lobby"
 							) {
+
 								return new Response(
 									"Room not found.",
 									{
-										status: 404,
+										status:
+											404,
 									}
 								);
 							}
 
 
-							// Only our GitHub chatroom
-							// may initiate connections.
+							/*
+							 * Connections must
+							 * originate from your
+							 * GitHub Pages site.
+							 */
+
 							const origin =
 								req.headers.get(
 									"Origin"
@@ -250,12 +535,14 @@ export default {
 
 							if (
 								origin !==
-								ALLOWED_ORIGIN
+									ALLOWED_ORIGIN
 							) {
+
 								return new Response(
 									"Forbidden.",
 									{
-										status: 403,
+										status:
+											403,
 									}
 								);
 							}
@@ -274,18 +561,23 @@ export default {
 
 
 							if (!token) {
+
 								return new Response(
 									"Login required.",
 									{
-										status: 401,
+										status:
+											401,
 									}
 								);
 							}
 
 
-							// Ask our existing
-							// authentication Worker
-							// whether this session is valid.
+							/*
+							 * Ask the existing
+							 * authentication Worker
+							 * who this person is.
+							 */
+
 							const authResponse =
 								await env.AUTH.fetch(
 									new Request(
@@ -306,42 +598,55 @@ export default {
 							if (
 								!authResponse.ok
 							) {
+
 								return new Response(
 									"Invalid session.",
 									{
-										status: 401,
+										status:
+											401,
 									}
 								);
 							}
 
 
 							const authData =
-								await authResponse.json() as {
-									ok?: boolean;
+								await authResponse
+									.json() as {
 
-									user?: {
-										username?: string;
-										role?: string;
-									};
+								ok?: boolean;
+
+								user?: {
+									username?:
+										string;
+
+									role?:
+										string;
 								};
+							};
 
 
 							if (
 								!authData.ok ||
-								!authData.user?.username
+								!authData.user
+									?.username
 							) {
+
 								return new Response(
 									"Invalid session.",
 									{
-										status: 401,
+										status:
+											401,
 									}
 								);
 							}
 
 
-							// Strip the token before
-							// forwarding the request to
-							// the Durable Object.
+							/*
+							 * Never pass the session
+							 * token into the Durable
+							 * Object itself.
+							 */
+
 							url.searchParams.delete(
 								"token"
 							);
@@ -354,17 +659,17 @@ export default {
 								);
 
 
-							// The Durable Object receives
-							// the VERIFIED username.
 							forwarded.headers.set(
 								"x-chat-username",
-								authData.user.username
+								authData.user
+									.username
 							);
 
 
 							forwarded.headers.set(
 								"x-chat-role",
-								authData.user.role ||
+								authData.user
+									.role ||
 									"user"
 							);
 
@@ -384,4 +689,5 @@ export default {
 			request
 		);
 	},
+
 } satisfies ExportedHandler<Env>;
