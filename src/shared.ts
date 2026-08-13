@@ -1,55 +1,24 @@
+export type ChatRole = "user" | "mod" | "admin" | "assistant";
+
+export type MessageFormat = {
+	bold?: boolean;
+	italic?: boolean;
+	underline?: boolean;
+	strike?: boolean;
+	color?: string;
+	size?: "small" | "normal" | "large";
+};
+
 export type ChatMessage = {
 	id: string;
 	content: string;
 	user: string;
-	role: "user" | "assistant";
+	role: ChatRole;
+	format?: MessageFormat;
+	replyTo?: string | null;
+	createdAt?: number;
+	updatedAt?: number | null;
+	deleted?: boolean;
+	highlightColor?: string | null;
+	reactions?: Record<string, number>;
 };
-
-export type Message =
-	| {
-			type: "add";
-			id: string;
-			content: string;
-			user: string;
-			role: "user" | "assistant";
-	  }
-	| {
-			type: "update";
-			id: string;
-			content: string;
-			user: string;
-			role: "user" | "assistant";
-	  }
-	| {
-			type: "all";
-			messages: ChatMessage[];
-	  };
-
-export const names = [
-	"Alice",
-	"Bob",
-	"Charlie",
-	"David",
-	"Eve",
-	"Frank",
-	"Grace",
-	"Heidi",
-	"Ivan",
-	"Judy",
-	"Kevin",
-	"Linda",
-	"Mallory",
-	"Nancy",
-	"Oscar",
-	"Peggy",
-	"Quentin",
-	"Randy",
-	"Steve",
-	"Trent",
-	"Ursula",
-	"Victor",
-	"Walter",
-	"Xavier",
-	"Yvonne",
-	"Zoe",
-];
