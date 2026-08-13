@@ -12,7 +12,7 @@ const ALLOWED_ORIGIN = "https://drkodoom.github.io";
 const HISTORY_LIMIT = 100;
 const EDIT_WINDOW_MS = 10 * 60 * 1000;
 const ALLOWED_REACTIONS = new Set(["👍", "❤️", "😂", "😮", "👎"]);
-const ALLOWED_ROOM_THEMES = new Set(["modern", "aol90", "terminal", "future", "comic", "arcade"]);
+const ALLOWED_ROOM_THEMES = new Set(["modern", "aol90", "terminal", "future", "comic", "arcade", "space", "tavern", "cartoon80", "vhs", "newsroom", "coffee"]);
 
 const validColor = (value: unknown) => {
 	const color = String(value || "").trim();
@@ -121,7 +121,29 @@ type BossGame = {
 	startedAt: number;
 };
 
-type GameState = HangmanGame | BossGame | null;
+type WerewolfRole = "werewolf" | "villager";
+
+type WerewolfPlayer = {
+	username: string;
+	role: WerewolfRole;
+	alive: boolean;
+};
+
+type WerewolfGame = {
+	type: "werewolf";
+	status: "active" | "villagers_win" | "werewolves_win" | "ended";
+	host: string;
+	phase: "night" | "day" | "ended";
+	day: number;
+	wolfCount: number;
+	players: Record<string, WerewolfPlayer>;
+	nightChoices: Record<string, string>;
+	dayVotes: Record<string, string>;
+	log: string[];
+	startedAt: number;
+};
+
+type GameState = HangmanGame | BossGame | WerewolfGame | null;
 
 type ClientMessage =
 	| { type: "add"; id?: string; content?: string; format?: unknown; replyTo?: string | null }
@@ -147,10 +169,11 @@ type ClientMessage =
 	| { type: "admin_confetti" }
 	| { type: "admin_identity"; hideAdminBadge?: boolean; maskName?: string | null }
 	| { type: "staff_user_color"; username?: string; nameColor?: string | null }
-	| { type: "game_start"; game?: "hangman" | "boss"; phrase?: string; boss?: BossKey }
+	| { type: "game_start"; game?: "hangman" | "boss" | "werewolf"; phrase?: string; boss?: BossKey }
 	| { type: "game_hangman_guess"; guess?: string }
 	| { type: "game_boss_attack" }
 	| { type: "game_boss_skip" }
+	| { type: "game_werewolf_force" }
 	| { type: "game_end" };
 
 export class Chat extends Server<Env> {
@@ -329,6 +352,13 @@ export class Chat extends Server<Env> {
 				if (!Number.isInteger(this.game.turnIndex) || this.game.turnIndex < 0 || this.game.turnIndex >= Math.max(1, this.game.turnOrder.length)) this.game.turnIndex = 0;
 				if (!Number.isInteger(this.game.round) || this.game.round < 1) this.game.round = 1;
 			}
+			if (this.game?.type === "werewolf") {
+				if (!this.game.players || typeof this.game.players !== "object") this.game.players = {};
+				if (!this.game.nightChoices || typeof this.game.nightChoices !== "object") this.game.nightChoices = {};
+				if (!this.game.dayVotes || typeof this.game.dayVotes !== "object") this.game.dayVotes = {};
+				if (!Number.isInteger(this.game.day) || this.game.day < 1) this.game.day = 1;
+				if (!["night", "day", "ended"].includes(this.game.phase)) this.game.phase = "night";
+			}
 		} catch {
 			this.game = null;
 		}
@@ -501,6 +531,37 @@ export class Chat extends Server<Env> {
 				startedAt: this.game.startedAt,
 			};
 		}
+		if (this.game.type === "werewolf") {
+			const livingEntries = Object.entries(this.game.players).filter(([, player]) => player.alive);
+			const requiredNight = livingEntries
+				.filter(([key, player]) => player.role === "werewolf" && this.isUsernameOnline(key))
+				.map(([key]) => key);
+			const requiredDay = livingEntries
+				.filter(([key]) => this.isUsernameOnline(key))
+				.map(([key]) => key);
+			const reveal = this.game.status !== "active";
+			return {
+				type: "werewolf",
+				status: this.game.status,
+				host: this.game.host,
+				phase: this.game.phase,
+				day: this.game.day,
+				wolfCount: this.game.wolfCount,
+				players: Object.entries(this.game.players).map(([key, player]) => ({
+					username: player.username,
+					alive: player.alive,
+					role: reveal ? player.role : undefined,
+					online: this.isUsernameOnline(key),
+				})),
+				aliveCount: livingEntries.length,
+				actionsCast: requiredNight.filter((key) => Boolean(this.game && this.game.type === "werewolf" && this.game.nightChoices[key])).length,
+				requiredActions: requiredNight.length,
+				votesCast: requiredDay.filter((key) => Boolean(this.game && this.game.type === "werewolf" && this.game.dayVotes[key])).length,
+				requiredVotes: requiredDay.length,
+				log: this.game.log,
+				startedAt: this.game.startedAt,
+			};
+		}
 		const currentKey = this.game.turnOrder?.[this.game.turnIndex] || null;
 		const currentPlayer = currentKey ? this.game.players[currentKey] : null;
 		return {
@@ -555,6 +616,272 @@ export class Chat extends Server<Env> {
 			lastActionAt: 0,
 			effects: [],
 		};
+	}
+
+
+	shuffle<T>(items: T[]) {
+		for (let i = items.length - 1; i > 0; i -= 1) {
+			const j = this.randomInt(0, i);
+			[items[i], items[j]] = [items[j], items[i]];
+		}
+		return items;
+	}
+
+	startWerewolfGame(hostState: ChatConnectionState, connection: Connection) {
+		const states = this.getUniqueConnectionStates();
+		if (states.length < 4) {
+			return this.sendError(connection, "Werewolf needs at least 4 people online when the game starts.");
+		}
+
+		const keys = states.map((player) => player.username.toLowerCase());
+		this.shuffle(keys);
+		const wolfCount = states.length >= 7 ? 2 : 1;
+		const wolves = new Set(keys.slice(0, wolfCount));
+		const players: Record<string, WerewolfPlayer> = {};
+
+		for (const playerState of states) {
+			const key = playerState.username.toLowerCase();
+			players[key] = {
+				username: this.publicName(playerState),
+				role: wolves.has(key) ? "werewolf" : "villager",
+				alive: true,
+			};
+		}
+
+		this.game = {
+			type: "werewolf",
+			status: "active",
+			host: this.publicName(hostState),
+			phase: "night",
+			day: 1,
+			wolfCount,
+			players,
+			nightChoices: {},
+			dayVotes: {},
+			log: [
+				`${this.publicName(hostState)} started Werewolf with ${states.length} players.`,
+				`Night 1 falls. The village goes quiet.`,
+			],
+			startedAt: Date.now(),
+		};
+		this.saveGame();
+		this.broadcastGame();
+		this.sendWerewolfSecrets();
+		this.broadcastGameEvent(`Werewolf has begun. Night 1 falls over the village.`, "critical");
+	}
+
+	werewolfPlayerKey(game: WerewolfGame, input: string) {
+		const wanted = String(input || "").trim().toLowerCase();
+		if (!wanted) return null;
+		for (const [key, player] of Object.entries(game.players)) {
+			if (key === wanted || player.username.toLowerCase() === wanted) return key;
+		}
+		return null;
+	}
+
+	sendWerewolfSecret(connection: Connection) {
+		const state = connection.state as ChatConnectionState | null;
+		if (!state?.username || !this.game || this.game.type !== "werewolf") return;
+		const key = state.username.toLowerCase();
+		const player = this.game.players[key];
+		if (!player) {
+			connection.send(JSON.stringify({
+				type: "werewolf_secret",
+				secret: { participant: false, role: null, alive: false, teammates: [] },
+			}));
+			return;
+		}
+		const teammates = player.role === "werewolf"
+			? Object.entries(this.game.players)
+				.filter(([otherKey, other]) => otherKey !== key && other.role === "werewolf")
+				.map(([, other]) => other.username)
+			: [];
+		connection.send(JSON.stringify({
+			type: "werewolf_secret",
+			secret: {
+				participant: true,
+				role: player.role,
+				alive: player.alive,
+				teammates,
+			},
+		}));
+	}
+
+	sendWerewolfSecrets() {
+		if (!this.game || this.game.type !== "werewolf") return;
+		for (const connection of this.getConnections<ChatConnectionState>()) this.sendWerewolfSecret(connection);
+	}
+
+	werewolfCheckWinner(game: WerewolfGame) {
+		const living = Object.values(game.players).filter((player) => player.alive);
+		const wolves = living.filter((player) => player.role === "werewolf").length;
+		const villagers = living.filter((player) => player.role === "villager").length;
+
+		if (wolves === 0) {
+			game.status = "villagers_win";
+			game.phase = "ended";
+			this.addGameLog("Every werewolf has been eliminated. The village survives!");
+			this.broadcastGameEvent("The villagers win — every werewolf has been eliminated!", "good");
+			return true;
+		}
+		if (wolves >= villagers) {
+			game.status = "werewolves_win";
+			game.phase = "ended";
+			this.addGameLog("The werewolves now equal or outnumber the villagers.");
+			this.broadcastGameEvent("The werewolves win — the village has been overrun!", "bad");
+			return true;
+		}
+		return false;
+	}
+
+	resolveWerewolfNight(game: WerewolfGame, forced = false) {
+		if (game.status !== "active" || game.phase !== "night") return;
+		const choices = Object.values(game.nightChoices)
+			.filter((targetKey) => Boolean(game.players[targetKey]?.alive && game.players[targetKey]?.role === "villager"));
+
+		let victimKey: string | null = null;
+		if (choices.length) {
+			const tally = new Map<string, number>();
+			for (const targetKey of choices) tally.set(targetKey, (tally.get(targetKey) || 0) + 1);
+			const max = Math.max(...tally.values());
+			const leaders = Array.from(tally.entries()).filter(([, count]) => count === max).map(([key]) => key);
+			victimKey = leaders[this.randomInt(0, leaders.length - 1)] || null;
+		}
+
+		game.nightChoices = {};
+		if (victimKey && game.players[victimKey]?.alive) {
+			game.players[victimKey].alive = false;
+			const victim = game.players[victimKey];
+			this.addGameLog(`Dawn breaks. ${victim.username} was killed during the night.`);
+			this.broadcastGameEvent(`Dawn breaks. ${victim.username} was killed during the night.`, "bad");
+		} else {
+			const text = forced ? "Dawn breaks. The night ended before the werewolves claimed a victim." : "Dawn breaks. No one died during the night.";
+			this.addGameLog(text);
+			this.broadcastGameEvent(text, "normal");
+		}
+
+		if (!this.werewolfCheckWinner(game)) {
+			game.phase = "day";
+			game.dayVotes = {};
+			this.addGameLog(`Day ${game.day} begins. Discuss, then vote with /vote Name.`);
+			this.broadcastGameEvent(`Day ${game.day} begins. Discuss who you suspect, then type /vote Name.`, "normal");
+		}
+		this.saveGame();
+		this.broadcastGame();
+		this.sendWerewolfSecrets();
+	}
+
+	resolveWerewolfDay(game: WerewolfGame, forced = false) {
+		if (game.status !== "active" || game.phase !== "day") return;
+		const validVotes = Object.entries(game.dayVotes)
+			.filter(([voterKey, targetKey]) => game.players[voterKey]?.alive && game.players[targetKey]?.alive);
+
+		let eliminatedKey: string | null = null;
+		let tied = false;
+		if (validVotes.length) {
+			const tally = new Map<string, number>();
+			for (const [, targetKey] of validVotes) tally.set(targetKey, (tally.get(targetKey) || 0) + 1);
+			const max = Math.max(...tally.values());
+			const leaders = Array.from(tally.entries()).filter(([, count]) => count === max).map(([key]) => key);
+			if (leaders.length === 1) eliminatedKey = leaders[0];
+			else tied = true;
+		}
+
+		game.dayVotes = {};
+		if (eliminatedKey && game.players[eliminatedKey]?.alive) {
+			const eliminated = game.players[eliminatedKey];
+			eliminated.alive = false;
+			const roleName = eliminated.role === "werewolf" ? "WEREWOLF" : "VILLAGER";
+			this.addGameLog(`${eliminated.username} was voted out. They were a ${roleName}.`);
+			this.broadcastGameEvent(`${eliminated.username} was voted out. They were a ${roleName}.`, eliminated.role === "werewolf" ? "good" : "bad");
+		} else if (tied) {
+			this.addGameLog("The vote ended in a tie. Nobody was eliminated.");
+			this.broadcastGameEvent("The village vote ended in a tie. Nobody was eliminated.", "normal");
+		} else {
+			const text = forced ? "Voting was closed without enough votes to eliminate anyone." : "Nobody was eliminated.";
+			this.addGameLog(text);
+			this.broadcastGameEvent(text, "normal");
+		}
+
+		if (!this.werewolfCheckWinner(game)) {
+			game.day += 1;
+			game.phase = "night";
+			game.nightChoices = {};
+			this.addGameLog(`Night ${game.day} falls. The village goes quiet.`);
+			this.broadcastGameEvent(`Night ${game.day} falls. The village goes quiet.`, "critical");
+		}
+		this.saveGame();
+		this.broadcastGame();
+		this.sendWerewolfSecrets();
+	}
+
+	maybeResolveWerewolf(game: WerewolfGame, excludeConnectionId?: string) {
+		if (game.status !== "active") return;
+		if (game.phase === "night") {
+			const required = Object.entries(game.players)
+				.filter(([key, player]) => player.alive && player.role === "werewolf" && this.isUsernameOnline(key, excludeConnectionId))
+				.map(([key]) => key);
+			if (required.length > 0 && required.every((key) => Boolean(game.nightChoices[key]))) this.resolveWerewolfNight(game);
+			return;
+		}
+
+		const required = Object.entries(game.players)
+			.filter(([key, player]) => player.alive && this.isUsernameOnline(key, excludeConnectionId))
+			.map(([key]) => key);
+		if (required.length > 0 && required.every((key) => Boolean(game.dayVotes[key]))) this.resolveWerewolfDay(game);
+	}
+
+	werewolfKill(state: ChatConnectionState, connection: Connection, targetInput: string) {
+		if (!this.game || this.game.type !== "werewolf" || this.game.status !== "active") return this.sendError(connection, "No Werewolf game is active.");
+		const game = this.game;
+		if (game.phase !== "night") return this.sendError(connection, "The werewolves can only choose a victim at night.");
+		const key = state.username.toLowerCase();
+		const player = game.players[key];
+		if (!player) return this.sendError(connection, "You are observing this round and do not have a night action.");
+		if (!player.alive) return this.sendError(connection, "You have been eliminated from this round.");
+		if (player.role !== "werewolf") return this.sendError(connection, "You do not have a night action.");
+
+		const targetKey = this.werewolfPlayerKey(game, targetInput);
+		if (!targetKey) return this.sendError(connection, "That player is not part of this Werewolf round.");
+		const target = game.players[targetKey];
+		if (!target.alive) return this.sendError(connection, `${target.username} has already been eliminated.`);
+		if (target.role === "werewolf") return this.sendError(connection, "Werewolves cannot choose another werewolf as the night victim.");
+
+		game.nightChoices[key] = targetKey;
+		connection.send(JSON.stringify({ type: "werewolf_action", message: `Night choice locked: ${target.username}.` }));
+		this.saveGame();
+		this.broadcastGame();
+		this.maybeResolveWerewolf(game);
+	}
+
+	werewolfVote(state: ChatConnectionState, connection: Connection, targetInput: string) {
+		if (!this.game || this.game.type !== "werewolf" || this.game.status !== "active") return this.sendError(connection, "No Werewolf game is active.");
+		const game = this.game;
+		if (game.phase !== "day") return this.sendError(connection, "Voting happens during the day.");
+		const key = state.username.toLowerCase();
+		const player = game.players[key];
+		if (!player) return this.sendError(connection, "You are observing this round and cannot vote.");
+		if (!player.alive) return this.sendError(connection, "You have been eliminated and cannot vote.");
+
+		const targetKey = this.werewolfPlayerKey(game, targetInput);
+		if (!targetKey) return this.sendError(connection, "That player is not part of this Werewolf round.");
+		const target = game.players[targetKey];
+		if (!target.alive) return this.sendError(connection, `${target.username} has already been eliminated.`);
+		if (targetKey === key) return this.sendError(connection, "You cannot vote for yourself.");
+
+		game.dayVotes[key] = targetKey;
+		connection.send(JSON.stringify({ type: "werewolf_action", message: `Vote locked: ${target.username}. You can change it until voting resolves.` }));
+		this.broadcastGameEvent(`${player.username} has voted.`, "normal");
+		this.saveGame();
+		this.broadcastGame();
+		this.maybeResolveWerewolf(game);
+	}
+
+	forceWerewolfPhase(state: ChatConnectionState, connection: Connection) {
+		if (!this.isStaff(state)) return this.staffError(connection);
+		if (!this.game || this.game.type !== "werewolf" || this.game.status !== "active") return this.sendError(connection, "No active Werewolf game.");
+		if (this.game.phase === "night") this.resolveWerewolfNight(this.game, true);
+		else this.resolveWerewolfDay(this.game, true);
 	}
 
 	startBossGame(hostState: ChatConnectionState, bossKey: BossKey) {
@@ -938,6 +1265,10 @@ export class Chat extends Server<Env> {
 			this.saveGame();
 			this.broadcastGame();
 		}
+		if (this.game?.type === "werewolf") {
+			this.sendWerewolfSecret(connection);
+			this.broadcastGame();
+		}
 		if (!alreadyOnline) this.broadcastSystem("join", this.publicName(connectedState));
 		this.broadcastPresence();
 	}
@@ -960,6 +1291,11 @@ export class Chat extends Server<Env> {
 					this.saveGame();
 					this.broadcastGame();
 				}
+			}
+			if (this.game?.type === "werewolf" && this.game.status === "active") {
+				this.maybeResolveWerewolf(this.game, connection.id);
+				this.broadcastGame();
+				this.sendWerewolfSecrets();
 			}
 		}
 		this.broadcastPresence(connection.id);
@@ -1186,6 +1522,13 @@ export class Chat extends Server<Env> {
 				this.saveGame();
 				this.broadcastGame();
 			}
+			if (this.game?.type === "werewolf") {
+				const player = this.game.players[state.username.toLowerCase()];
+				if (player) player.username = displayName;
+				this.saveGame();
+				this.broadcastGame();
+				this.sendWerewolfSecrets();
+			}
 			return;
 		}
 
@@ -1272,6 +1615,10 @@ export class Chat extends Server<Env> {
 				this.startBossGame(state, boss);
 				return;
 			}
+			if (parsed.game === "werewolf") {
+				this.startWerewolfGame(state, connection);
+				return;
+			}
 			return this.sendError(connection, "Choose a game to start.");
 		}
 
@@ -1347,6 +1694,11 @@ export class Chat extends Server<Env> {
 			return;
 		}
 
+		if (parsed.type === "game_werewolf_force") {
+			this.forceWerewolfPhase(state, connection);
+			return;
+		}
+
 		if (parsed.type === "reaction") {
 			const id = String(parsed.id || "");
 			const emoji = String(parsed.emoji || "");
@@ -1414,6 +1766,25 @@ export class Chat extends Server<Env> {
 		if (commandContent.toLowerCase() === "/roll") {
 			this.bossBattleAttack(state, connection);
 			return;
+		}
+		if (/^\/kill(?:\s+|$)/i.test(commandContent)) {
+			const target = commandContent.slice(5).trim();
+			if (!target) return this.sendError(connection, "Use /kill ScreenName.");
+			this.werewolfKill(state, connection, target);
+			return;
+		}
+		if (/^\/vote(?:\s+|$)/i.test(commandContent)) {
+			const target = commandContent.slice(5).trim();
+			if (!target) return this.sendError(connection, "Use /vote ScreenName.");
+			this.werewolfVote(state, connection, target);
+			return;
+		}
+
+		if (this.game?.type === "werewolf" && this.game.status === "active") {
+			const player = this.game.players[state.username.toLowerCase()];
+			if (!player) return this.sendError(connection, "You are observing this Werewolf round. Observers cannot influence the game.");
+			if (!player.alive) return this.sendError(connection, "You have been eliminated from this Werewolf round. Watch until the round ends.");
+			if (this.game.phase === "night") return this.sendError(connection, "The village is asleep. Discussion resumes at daybreak.");
 		}
 
 		const mute = this.isMuted(state.username);
