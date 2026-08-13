@@ -143,7 +143,58 @@ type WerewolfGame = {
 	startedAt: number;
 };
 
-type GameState = HangmanGame | BossGame | WerewolfGame | null;
+
+type RpsChoice = "rock" | "paper" | "scissors";
+
+type RpsPlayerRef = {
+	username: string;
+	displayName: string;
+};
+
+type RpsDuelGame = {
+	type: "rps_duel";
+	status: "challenged" | "active" | "complete" | "declined" | "ended";
+	host: string;
+	challenger: RpsPlayerRef;
+	opponent: RpsPlayerRef;
+	bestOf: number;
+	requiredWins: number;
+	score: Record<string, number>;
+	choices: Record<string, RpsChoice>;
+	round: number;
+	winner: RpsPlayerRef | null;
+	log: string[];
+	startedAt: number;
+};
+
+type RpsTournamentMatch = {
+	id: string;
+	playerA: RpsPlayerRef | null;
+	playerB: RpsPlayerRef | null;
+	winner: RpsPlayerRef | null;
+	status: "pending" | "active" | "complete" | "bye";
+	scoreA: number;
+	scoreB: number;
+	requiredWins: number;
+	choices: Record<string, RpsChoice>;
+	throws: number;
+};
+
+type RpsTournamentGame = {
+	type: "rps_tournament";
+	status: "registration" | "active" | "complete" | "ended";
+	host: string;
+	participants: RpsPlayerRef[];
+	rounds: RpsTournamentMatch[][];
+	currentRound: number;
+	currentMatch: number;
+	champion: RpsPlayerRef | null;
+	runnerUp: RpsPlayerRef | null;
+	log: string[];
+	startedAt: number;
+};
+
+type GameState = HangmanGame | BossGame | WerewolfGame | RpsDuelGame | RpsTournamentGame | null;
 
 type ClientMessage =
 	| { type: "add"; id?: string; content?: string; format?: unknown; replyTo?: string | null }
@@ -169,7 +220,13 @@ type ClientMessage =
 	| { type: "admin_confetti" }
 	| { type: "admin_identity"; hideAdminBadge?: boolean; maskName?: string | null }
 	| { type: "staff_user_color"; username?: string; nameColor?: string | null }
-	| { type: "game_start"; game?: "hangman" | "boss" | "werewolf"; phrase?: string; boss?: BossKey }
+	| { type: "game_start"; game?: "hangman" | "boss" | "werewolf" | "rps_tournament"; phrase?: string; boss?: BossKey }
+	| { type: "rps_challenge"; username?: string }
+	| { type: "rps_accept" }
+	| { type: "rps_decline" }
+	| { type: "rps_pick"; choice?: RpsChoice }
+	| { type: "rps_tournament_join" }
+	| { type: "rps_tournament_start" }
 	| { type: "game_hangman_guess"; guess?: string }
 	| { type: "game_boss_attack" }
 	| { type: "game_boss_skip" }
@@ -242,6 +299,15 @@ export class Chat extends Server<Env> {
 			)
 		`);
 		this.ctx.storage.sql.exec(`INSERT OR IGNORE INTO game_state (id, state_json) VALUES (1, '')`);
+
+		this.ctx.storage.sql.exec(`
+			CREATE TABLE IF NOT EXISTS activity_stats (
+				username TEXT PRIMARY KEY COLLATE NOCASE,
+				message_count INTEGER NOT NULL DEFAULT 0,
+				active_days INTEGER NOT NULL DEFAULT 0,
+				last_active_day TEXT
+			)
+		`);
 
 		this.ctx.storage.sql.exec(`
 			CREATE TABLE IF NOT EXISTS mutes (
@@ -531,6 +597,60 @@ export class Chat extends Server<Env> {
 				startedAt: this.game.startedAt,
 			};
 		}
+
+		if (this.game.type === "rps_duel") {
+			const aKey = this.game.challenger.username.toLowerCase();
+			const bKey = this.game.opponent.username.toLowerCase();
+			return {
+				type: "rps_duel",
+				status: this.game.status,
+				host: this.game.host,
+				challenger: this.game.challenger,
+				opponent: this.game.opponent,
+				bestOf: this.game.bestOf,
+				requiredWins: this.game.requiredWins,
+				score: this.game.score,
+				locked: {
+					[aKey]: Boolean(this.game.choices[aKey]),
+					[bKey]: Boolean(this.game.choices[bKey]),
+				},
+				round: this.game.round,
+				winner: this.game.winner,
+				log: this.game.log,
+				startedAt: this.game.startedAt,
+			};
+		}
+		if (this.game.type === "rps_tournament") {
+			const current = this.currentRpsTournamentMatch(this.game);
+			const locked: Record<string, boolean> = {};
+			if (current?.playerA) locked[current.playerA.username.toLowerCase()] = Boolean(current.choices[current.playerA.username.toLowerCase()]);
+			if (current?.playerB) locked[current.playerB.username.toLowerCase()] = Boolean(current.choices[current.playerB.username.toLowerCase()]);
+			return {
+				type: "rps_tournament",
+				status: this.game.status,
+				host: this.game.host,
+				participants: this.game.participants,
+				rounds: this.game.rounds.map((round) => round.map((match) => ({
+					id: match.id,
+					playerA: match.playerA,
+					playerB: match.playerB,
+					winner: match.winner,
+					status: match.status,
+					scoreA: match.scoreA,
+					scoreB: match.scoreB,
+					requiredWins: match.requiredWins,
+					throws: match.throws,
+				}))),
+				currentRound: this.game.currentRound,
+				currentMatch: this.game.currentMatch,
+				currentMatchId: current?.id || null,
+				locked,
+				champion: this.game.champion,
+				runnerUp: this.game.runnerUp,
+				log: this.game.log,
+				startedAt: this.game.startedAt,
+			};
+		}
 		if (this.game.type === "werewolf") {
 			const livingEntries = Object.entries(this.game.players).filter(([, player]) => player.alive);
 			const requiredNight = livingEntries
@@ -591,6 +711,359 @@ export class Chat extends Server<Env> {
 			return;
 		}
 		player.effects.push(effect);
+	}
+
+
+
+	recordChatActivity(username: string) {
+		const day = new Date().toISOString().slice(0, 10);
+		const existing = this.ctx.storage.sql.exec(
+			`SELECT message_count, active_days, last_active_day FROM activity_stats WHERE lower(username) = lower(?) LIMIT 1`,
+			username,
+		).toArray()[0] as Record<string, unknown> | undefined;
+		let count = Number(existing?.message_count || 0) + 1;
+		let activeDays = Number(existing?.active_days || 0);
+		const lastDay = String(existing?.last_active_day || "");
+		if (!existing) activeDays = 1;
+		else if (lastDay !== day) activeDays += 1;
+		this.ctx.storage.sql.exec(
+			`INSERT INTO activity_stats (username, message_count, active_days, last_active_day)
+			 VALUES (?, ?, ?, ?)
+			 ON CONFLICT(username) DO UPDATE SET message_count = excluded.message_count, active_days = excluded.active_days, last_active_day = excluded.last_active_day`,
+			username, count, activeDays, day,
+		);
+		if (count === 100) this.runBackground(this.recordGameReward(username, "century_club", "chat_activity"));
+		if (activeDays === 7 && lastDay !== day) this.runBackground(this.recordGameReward(username, "chat_regular", "chat_activity"));
+	}
+
+	playerRef(state: ChatConnectionState): RpsPlayerRef {
+		return { username: state.username, displayName: this.publicName(state) };
+	}
+
+	findOnlineState(name: string): ChatConnectionState | null {
+		const target = String(name || "").trim().replace(/^@/, "").toLowerCase();
+		if (!target) return null;
+		for (const connection of this.getConnections<ChatConnectionState>()) {
+			const state = connection.state;
+			if (!state?.username) continue;
+			if (state.username.toLowerCase() === target || this.publicName(state).toLowerCase() === target) return state;
+		}
+		return null;
+	}
+
+	rpsOutcome(a: RpsChoice, b: RpsChoice): 0 | 1 | 2 {
+		if (a === b) return 0;
+		if ((a === "rock" && b === "scissors") || (a === "paper" && b === "rock") || (a === "scissors" && b === "paper")) return 1;
+		return 2;
+	}
+
+	rpsIcon(choice: RpsChoice) {
+		return choice === "rock" ? "✊" : choice === "paper" ? "✋" : "✌️";
+	}
+
+	runBackground(promise: Promise<unknown>) {
+		const ctx = this.ctx as unknown as { waitUntil?: (value: Promise<unknown>) => void };
+		if (ctx.waitUntil) ctx.waitUntil(promise.catch(() => undefined));
+		else void promise.catch(() => undefined);
+	}
+
+
+	async recordGameReward(username: string, rewardKey: string, source: string, metadata: Record<string, unknown> = {}) {
+		try {
+			await this.env.AUTH.fetch(new Request("https://chatroom.internal/internal/award", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ username, reward_key: rewardKey, source, metadata }),
+			}));
+		} catch {
+			// Rewards must never interrupt live play.
+		}
+	}
+
+	async recordRpsMatch(playerA: RpsPlayerRef, playerB: RpsPlayerRef, choiceA: RpsChoice, choiceB: RpsChoice, winner: RpsPlayerRef | null, matchComplete = false) {
+		try {
+			await this.env.AUTH.fetch(new Request("https://chatroom.internal/internal/rps-match", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					player_a: playerA.username,
+					player_b: playerB.username,
+					choice_a: choiceA,
+					choice_b: choiceB,
+					winner: winner?.username || "",
+					match_complete: matchComplete,
+				}),
+			}));
+		} catch {
+			// Game results still resolve even if profile-stat recording is temporarily unavailable.
+		}
+	}
+
+	async recordRpsTournamentFinish(winner: RpsPlayerRef, runnerUp: RpsPlayerRef | null, undefeated = true) {
+		try {
+			await this.env.AUTH.fetch(new Request("https://chatroom.internal/internal/rps-tournament-finish", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					winner: winner.username,
+					runner_up: runnerUp?.username || "",
+					undefeated,
+				}),
+			}));
+		} catch {
+			// Do not block the room if the profile service is unavailable.
+		}
+	}
+
+	startRpsChallenge(state: ChatConnectionState, connection: Connection, targetName: string) {
+		if (this.game && !["won", "lost", "villagers_win", "werewolves_win", "complete", "declined", "ended"].includes(String(this.game.status))) {
+			return this.sendError(connection, "Another room game or RPS challenge is already in progress.");
+		}
+		const targetState = this.findOnlineState(targetName);
+		if (!targetState) return this.sendError(connection, `${targetName.replace(/^@/, "")} is not online.`);
+		if (targetState.username.toLowerCase() === state.username.toLowerCase()) return this.sendError(connection, "You cannot challenge yourself.");
+		const challenger = this.playerRef(state);
+		const opponent = this.playerRef(targetState);
+		this.game = {
+			type: "rps_duel",
+			status: "challenged",
+			host: challenger.displayName,
+			challenger,
+			opponent,
+			bestOf: 3,
+			requiredWins: 2,
+			score: { [challenger.username.toLowerCase()]: 0, [opponent.username.toLowerCase()]: 0 },
+			choices: {},
+			round: 1,
+			winner: null,
+			log: [`${challenger.displayName} challenged ${opponent.displayName} to best-of-3 Rock Paper Scissors.`],
+			startedAt: Date.now(),
+		};
+		this.saveGame();
+		this.broadcastGame();
+		this.broadcastGameEvent(`${challenger.displayName} challenged ${opponent.displayName} to Rock Paper Scissors.`, "critical");
+	}
+
+	acceptRpsChallenge(state: ChatConnectionState, connection: Connection) {
+		if (!this.game || this.game.type !== "rps_duel" || this.game.status !== "challenged") return this.sendError(connection, "There is no RPS challenge waiting for you.");
+		if (state.username.toLowerCase() !== this.game.opponent.username.toLowerCase()) return this.sendError(connection, `Only ${this.game.opponent.displayName} can accept this challenge.`);
+		this.game.status = "active";
+		this.addGameLog(`${this.publicName(state)} accepted. Round 1 begins.`);
+		this.saveGame();
+		this.broadcastGame();
+	}
+
+	declineRpsChallenge(state: ChatConnectionState, connection: Connection) {
+		if (!this.game || this.game.type !== "rps_duel" || this.game.status !== "challenged") return this.sendError(connection, "There is no RPS challenge to decline.");
+		if (state.username.toLowerCase() !== this.game.opponent.username.toLowerCase()) return this.sendError(connection, `Only ${this.game.opponent.displayName} can decline this challenge.`);
+		this.game.status = "declined";
+		this.addGameLog(`${this.publicName(state)} declined the challenge.`);
+		this.saveGame();
+		this.broadcastGame();
+	}
+
+	rpsPickDuel(state: ChatConnectionState, connection: Connection, choice: RpsChoice) {
+		if (!this.game || this.game.type !== "rps_duel" || this.game.status !== "active") return this.sendError(connection, "No active RPS duel is waiting for a throw.");
+		const game = this.game;
+		const key = state.username.toLowerCase();
+		const aKey = game.challenger.username.toLowerCase();
+		const bKey = game.opponent.username.toLowerCase();
+		if (key !== aKey && key !== bKey) return this.sendError(connection, "You are watching this RPS match.");
+		if (game.choices[key]) return this.sendError(connection, "Your throw is already locked in. Wait for the other player.");
+		game.choices[key] = choice;
+		connection.send(JSON.stringify({ type: "rps_private", message: `Locked in ${choice.toUpperCase()}.` }));
+		this.broadcastGame();
+		if (!game.choices[aKey] || !game.choices[bKey]) return;
+
+		const choiceA = game.choices[aKey];
+		const choiceB = game.choices[bKey];
+		const outcome = this.rpsOutcome(choiceA, choiceB);
+		let roundWinner: RpsPlayerRef | null = null;
+		if (outcome === 1) roundWinner = game.challenger;
+		if (outcome === 2) roundWinner = game.opponent;
+		const reveal = `${game.challenger.displayName} ${this.rpsIcon(choiceA)} ${choiceA.toUpperCase()} · ${game.opponent.displayName} ${this.rpsIcon(choiceB)} ${choiceB.toUpperCase()}`;
+		if (!roundWinner) {
+			this.addGameLog(`${reveal} — DRAW. Throw again.`);
+			this.runBackground(this.recordRpsMatch(game.challenger, game.opponent, choiceA, choiceB, null));
+		} else {
+			game.score[roundWinner.username.toLowerCase()] = (game.score[roundWinner.username.toLowerCase()] || 0) + 1;
+			this.addGameLog(`${reveal} — ${roundWinner.displayName} wins the throw.`);
+			const matchComplete = game.score[roundWinner.username.toLowerCase()] >= game.requiredWins;
+			this.runBackground(this.recordRpsMatch(game.challenger, game.opponent, choiceA, choiceB, roundWinner, matchComplete));
+			if (matchComplete) {
+				game.status = "complete";
+				game.winner = roundWinner;
+				this.addGameLog(`🏆 ${roundWinner.displayName} wins the match ${game.score[aKey]}-${game.score[bKey]}.`);
+				this.broadcastGameEvent(`${roundWinner.displayName} wins the RPS challenge!`, "good");
+			} else {
+				game.round += 1;
+			}
+		}
+		game.choices = {};
+		this.saveGame();
+		this.broadcastGame();
+	}
+
+	startRpsTournamentRegistration(state: ChatConnectionState) {
+		const host = this.playerRef(state);
+		this.game = {
+			type: "rps_tournament",
+			status: "registration",
+			host: host.displayName,
+			participants: [host],
+			rounds: [],
+			currentRound: 0,
+			currentMatch: 0,
+			champion: null,
+			runnerUp: null,
+			log: [`${host.displayName} opened registration for the RPS Tournament.`],
+			startedAt: Date.now(),
+		};
+		this.saveGame();
+		this.broadcastGame();
+		this.broadcastGameEvent("Rock Paper Scissors Tournament registration is open! Type /rps join.", "critical");
+	}
+
+	joinRpsTournament(state: ChatConnectionState, connection: Connection) {
+		if (!this.game || this.game.type !== "rps_tournament" || this.game.status !== "registration") return this.sendError(connection, "RPS tournament registration is not open.");
+		const key = state.username.toLowerCase();
+		if (this.game.participants.some((player) => player.username.toLowerCase() === key)) return this.sendError(connection, "You are already in the tournament.");
+		this.game.participants.push(this.playerRef(state));
+		this.addGameLog(`${this.publicName(state)} joined the tournament.`);
+		this.saveGame();
+		this.broadcastGame();
+	}
+
+	makeRpsTournamentRound(players: RpsPlayerRef[], roundIndex: number): RpsTournamentMatch[] {
+		const shuffled = roundIndex === 0 ? this.shuffle([...players]) : [...players];
+		const matches: RpsTournamentMatch[] = [];
+		for (let i = 0; i < shuffled.length; i += 2) {
+			const playerA = shuffled[i] || null;
+			const playerB = shuffled[i + 1] || null;
+			const finalRound = shuffled.length === 2;
+			const match: RpsTournamentMatch = {
+				id: `r${roundIndex + 1}m${Math.floor(i / 2) + 1}-${Date.now().toString(36)}`,
+				playerA,
+				playerB,
+				winner: playerB ? null : playerA,
+				status: playerB ? "pending" : "bye",
+				scoreA: playerB ? 0 : 1,
+				scoreB: 0,
+				requiredWins: finalRound ? 3 : 2,
+				choices: {},
+				throws: 0,
+			};
+			matches.push(match);
+		}
+		return matches;
+	}
+
+	startRpsTournament(state: ChatConnectionState, connection: Connection) {
+		if (!this.isStaff(state)) return this.staffError(connection);
+		if (!this.game || this.game.type !== "rps_tournament" || this.game.status !== "registration") return this.sendError(connection, "No RPS tournament registration is open.");
+		if (this.game.participants.length < 2) return this.sendError(connection, "At least two players must join the tournament.");
+		this.game.status = "active";
+		this.game.rounds = [this.makeRpsTournamentRound(this.game.participants, 0)];
+		this.game.currentRound = 0;
+		this.game.currentMatch = 0;
+		this.activateNextRpsTournamentMatch(this.game);
+		this.addGameLog(`Bracket locked with ${this.game.participants.length} players.`);
+		this.saveGame();
+		this.broadcastGame();
+	}
+
+	currentRpsTournamentMatch(game: RpsTournamentGame) {
+		return game.rounds[game.currentRound]?.[game.currentMatch] || null;
+	}
+
+	activateNextRpsTournamentMatch(game: RpsTournamentGame) {
+		const round = game.rounds[game.currentRound] || [];
+		while (game.currentMatch < round.length) {
+			const match = round[game.currentMatch];
+			if (match.status === "bye" || match.status === "complete") {
+				game.currentMatch += 1;
+				continue;
+			}
+			match.status = "active";
+			if (match.playerA && match.playerB) this.addGameLog(`${match.playerA.displayName} vs ${match.playerB.displayName} — first to ${match.requiredWins}.`);
+			return;
+		}
+		this.finishRpsTournamentRound(game);
+	}
+
+	finishRpsTournamentRound(game: RpsTournamentGame) {
+		const round = game.rounds[game.currentRound] || [];
+		const winners = round.map((match) => match.winner).filter(Boolean) as RpsPlayerRef[];
+		if (winners.length === 1) {
+			game.status = "complete";
+			game.champion = winners[0];
+			const lastMatch = round.length === 1 ? round[0] : null;
+			if (lastMatch?.playerA && lastMatch?.playerB) {
+				game.runnerUp = lastMatch.winner?.username.toLowerCase() === lastMatch.playerA.username.toLowerCase() ? lastMatch.playerB : lastMatch.playerA;
+			}
+			this.addGameLog(`🏆 ${winners[0].displayName} is the RPS CHAMPION!`);
+			this.broadcastGameEvent(`${winners[0].displayName} wins the RPS Tournament!`, "good");
+			this.broadcast(JSON.stringify({ type: "confetti", actor: "RPS Tournament", at: Date.now() }));
+			this.runBackground(this.recordRpsTournamentFinish(winners[0], game.runnerUp, true));
+			return;
+		}
+		game.currentRound += 1;
+		game.currentMatch = 0;
+		game.rounds.push(this.makeRpsTournamentRound(winners, game.currentRound));
+		this.addGameLog(`Round ${game.currentRound + 1} begins.`);
+		this.activateNextRpsTournamentMatch(game);
+	}
+
+	rpsPickTournament(state: ChatConnectionState, connection: Connection, choice: RpsChoice) {
+		if (!this.game || this.game.type !== "rps_tournament" || this.game.status !== "active") return this.sendError(connection, "No active RPS tournament match is waiting for a throw.");
+		const game = this.game;
+		const match = this.currentRpsTournamentMatch(game);
+		if (!match || match.status !== "active" || !match.playerA || !match.playerB) return this.sendError(connection, "No tournament matchup is currently active.");
+		const key = state.username.toLowerCase();
+		const aKey = match.playerA.username.toLowerCase();
+		const bKey = match.playerB.username.toLowerCase();
+		if (key !== aKey && key !== bKey) return this.sendError(connection, `Current match: ${match.playerA.displayName} vs ${match.playerB.displayName}.`);
+		if (match.choices[key]) return this.sendError(connection, "Your throw is already locked in. Wait for your opponent.");
+		match.choices[key] = choice;
+		connection.send(JSON.stringify({ type: "rps_private", message: `Tournament throw locked: ${choice.toUpperCase()}.` }));
+		this.broadcastGame();
+		if (!match.choices[aKey] || !match.choices[bKey]) return;
+
+		const choiceA = match.choices[aKey];
+		const choiceB = match.choices[bKey];
+		const outcome = this.rpsOutcome(choiceA, choiceB);
+		match.throws += 1;
+		let throwWinner: RpsPlayerRef | null = null;
+		if (outcome === 1) throwWinner = match.playerA;
+		if (outcome === 2) throwWinner = match.playerB;
+		const reveal = `${match.playerA.displayName} ${this.rpsIcon(choiceA)} ${choiceA.toUpperCase()} · ${match.playerB.displayName} ${this.rpsIcon(choiceB)} ${choiceB.toUpperCase()}`;
+		if (!throwWinner) {
+			this.addGameLog(`${reveal} — DRAW. Throw again.`);
+			this.runBackground(this.recordRpsMatch(match.playerA, match.playerB, choiceA, choiceB, null));
+		} else {
+			if (throwWinner.username.toLowerCase() === aKey) match.scoreA += 1;
+			else match.scoreB += 1;
+			this.addGameLog(`${reveal} — ${throwWinner.displayName} takes the point (${match.scoreA}-${match.scoreB}).`);
+			const matchComplete = match.scoreA >= match.requiredWins || match.scoreB >= match.requiredWins;
+			this.runBackground(this.recordRpsMatch(match.playerA, match.playerB, choiceA, choiceB, throwWinner, matchComplete));
+			if (matchComplete) {
+				match.winner = match.scoreA > match.scoreB ? match.playerA : match.playerB;
+				match.status = "complete";
+				this.addGameLog(`${match.winner.displayName} advances.`);
+				game.currentMatch += 1;
+			}
+		}
+		match.choices = {};
+		if (match.status === "complete") this.activateNextRpsTournamentMatch(game);
+		this.saveGame();
+		this.broadcastGame();
+	}
+
+	rpsPick(state: ChatConnectionState, connection: Connection, choice: RpsChoice) {
+		if (!(["rock", "paper", "scissors"] as string[]).includes(choice)) return this.sendError(connection, "Use /rps rock, /rps paper, or /rps scissors.");
+		if (this.game?.type === "rps_duel") return this.rpsPickDuel(state, connection, choice);
+		if (this.game?.type === "rps_tournament") return this.rpsPickTournament(state, connection, choice);
+		return this.sendError(connection, "No RPS match is active.");
 	}
 
 	getUniqueConnectionStates() {
@@ -722,6 +1195,9 @@ export class Chat extends Server<Env> {
 			game.phase = "ended";
 			this.addGameLog("Every werewolf has been eliminated. The village survives!");
 			this.broadcastGameEvent("The villagers win — every werewolf has been eliminated!", "good");
+			for (const [key, player] of Object.entries(game.players)) {
+				if (player.role === "villager") this.runBackground(this.recordGameReward(key, "wolf_hunter", "werewolf"));
+			}
 			return true;
 		}
 		if (wolves >= villagers) {
@@ -729,6 +1205,9 @@ export class Chat extends Server<Env> {
 			game.phase = "ended";
 			this.addGameLog("The werewolves now equal or outnumber the villagers.");
 			this.broadcastGameEvent("The werewolves win — the village has been overrun!", "bad");
+			for (const [key, player] of Object.entries(game.players)) {
+				if (player.role === "werewolf") this.runBackground(this.recordGameReward(key, "werewolf_alpha", "werewolf"));
+			}
 			return true;
 		}
 		return false;
@@ -1139,6 +1618,10 @@ export class Chat extends Server<Env> {
 			const winText = `${game.bossName} is defeated! The party wins!`;
 			this.addGameLog(winText);
 			this.broadcastGameEvent(winText, "critical");
+			const rewardKey = game.bossKey === "mad_dragon" ? "dragon_slayer" : game.bossKey === "goblin_king" ? "kingslayer" : "spellbreaker";
+			for (const [key, participant] of Object.entries(game.players)) {
+				if (participant.attacks > 0) this.runBackground(this.recordGameReward(key, rewardKey, `boss:${game.bossKey}`));
+			}
 			this.saveGame();
 			this.broadcastGame();
 			return;
@@ -1296,6 +1779,44 @@ export class Chat extends Server<Env> {
 				this.maybeResolveWerewolf(this.game, connection.id);
 				this.broadcastGame();
 				this.sendWerewolfSecrets();
+			}
+
+			if (this.game?.type === "rps_duel" && ["challenged", "active"].includes(this.game.status)) {
+				const game = this.game;
+				const key = username.toLowerCase();
+				const aKey = game.challenger.username.toLowerCase();
+				const bKey = game.opponent.username.toLowerCase();
+				if (key === aKey || key === bKey) {
+					const other = key === aKey ? game.opponent : game.challenger;
+					if (game.status === "active") {
+						game.status = "complete";
+						game.winner = other;
+						this.addGameLog(`${this.publicName(state)} left. ${other.displayName} wins by forfeit.`);
+					} else {
+						game.status = "ended";
+						this.addGameLog(`${this.publicName(state)} left before the challenge began.`);
+					}
+					this.saveGame();
+					this.broadcastGame();
+				}
+			}
+			if (this.game?.type === "rps_tournament" && this.game.status === "active") {
+				const game = this.game;
+				const match = this.currentRpsTournamentMatch(game);
+				if (match?.status === "active" && match.playerA && match.playerB) {
+					const key = username.toLowerCase();
+					const aKey = match.playerA.username.toLowerCase();
+					const bKey = match.playerB.username.toLowerCase();
+					if (key === aKey || key === bKey) {
+						match.winner = key === aKey ? match.playerB : match.playerA;
+						match.status = "complete";
+						this.addGameLog(`${this.publicName(state)} left. ${match.winner.displayName} advances by forfeit.`);
+						game.currentMatch += 1;
+						this.activateNextRpsTournamentMatch(game);
+						this.saveGame();
+						this.broadcastGame();
+					}
+				}
 			}
 		}
 		this.broadcastPresence(connection.id);
@@ -1587,9 +2108,43 @@ export class Chat extends Server<Env> {
 			return;
 		}
 
+
+		if (parsed.type === "rps_challenge") {
+			const target = String(parsed.username || "").trim();
+			if (!target) return this.sendError(connection, "Choose someone to challenge.");
+			this.startRpsChallenge(state, connection, target);
+			return;
+		}
+
+		if (parsed.type === "rps_accept") {
+			this.acceptRpsChallenge(state, connection);
+			return;
+		}
+
+		if (parsed.type === "rps_decline") {
+			this.declineRpsChallenge(state, connection);
+			return;
+		}
+
+		if (parsed.type === "rps_pick") {
+			const choice = String(parsed.choice || "").toLowerCase() as RpsChoice;
+			this.rpsPick(state, connection, choice);
+			return;
+		}
+
+		if (parsed.type === "rps_tournament_join") {
+			this.joinRpsTournament(state, connection);
+			return;
+		}
+
+		if (parsed.type === "rps_tournament_start") {
+			this.startRpsTournament(state, connection);
+			return;
+		}
+
 		if (parsed.type === "game_start") {
 			if (!this.isStaff(state)) return this.staffError(connection);
-			if (this.game?.status === "active") return this.sendError(connection, "End the current game before starting another one.");
+			if (this.game && !["won", "lost", "villagers_win", "werewolves_win", "complete", "declined", "ended"].includes(String(this.game.status))) return this.sendError(connection, "End or clear the current game before starting another one.");
 			if (parsed.game === "hangman") {
 				const phrase = String(parsed.phrase || "").trim().replace(/\s+/g, " ").slice(0, 80);
 				if (phrase.length < 2 || !/[A-Za-z0-9]/.test(phrase)) return this.sendError(connection, "Enter a Hangman word or phrase between 2 and 80 characters.");
@@ -1617,6 +2172,10 @@ export class Chat extends Server<Env> {
 			}
 			if (parsed.game === "werewolf") {
 				this.startWerewolfGame(state, connection);
+				return;
+			}
+			if (parsed.game === "rps_tournament") {
+				this.startRpsTournamentRegistration(state);
 				return;
 			}
 			return this.sendError(connection, "Choose a game to start.");
@@ -1669,6 +2228,7 @@ export class Chat extends Server<Env> {
 					this.addGameLog(`Hangman is over. The answer was: ${game.phrase}`);
 				}
 			}
+			if (game.status === "won" && game.winner) this.runBackground(this.recordGameReward(state.username, "hangman_champion", "hangman"));
 			const latest = game.log[game.log.length - 1];
 			if (latest) this.broadcastGameEvent(latest, game.status === "won" ? "good" : (game.status === "lost" ? "bad" : "normal"));
 			this.saveGame();
@@ -1763,6 +2323,22 @@ export class Chat extends Server<Env> {
 		if (parsed.type !== "add") return;
 
 		const commandContent = String(parsed.content || "").trim();
+
+		if (/^\/rps(?:\s+|$)/i.test(commandContent)) {
+			const argument = commandContent.slice(4).trim();
+			const lowered = argument.toLowerCase();
+			if (!argument) return this.sendError(connection, "RPS commands: /rps @name, /rps accept, /rps decline, /rps join, /rps start, /rps rock|paper|scissors.");
+			if (["rock", "paper", "scissors"].includes(lowered)) {
+				this.rpsPick(state, connection, lowered as RpsChoice);
+				return;
+			}
+			if (lowered === "accept") { this.acceptRpsChallenge(state, connection); return; }
+			if (lowered === "decline") { this.declineRpsChallenge(state, connection); return; }
+			if (lowered === "join") { this.joinRpsTournament(state, connection); return; }
+			if (lowered === "start") { this.startRpsTournament(state, connection); return; }
+			this.startRpsChallenge(state, connection, argument);
+			return;
+		}
 		if (commandContent.toLowerCase() === "/roll") {
 			this.bossBattleAttack(state, connection);
 			return;
@@ -1832,6 +2408,7 @@ export class Chat extends Server<Env> {
 			JSON.stringify(cleanMessage.format), cleanMessage.replyTo, cleanMessage.createdAt,
 		);
 		connection.setState({ ...state, lastMessageAt: now });
+		this.recordChatActivity(state.username);
 		this.broadcast(JSON.stringify({ type: "add", ...this.serializeMessage(cleanMessage) }));
 	}
 
