@@ -12,7 +12,7 @@ const ALLOWED_ORIGIN = "https://drkodoom.github.io";
 const HISTORY_LIMIT = 100;
 const EDIT_WINDOW_MS = 10 * 60 * 1000;
 const ALLOWED_REACTIONS = new Set(["👍", "❤️", "😂", "😮", "👎"]);
-const ALLOWED_ROOM_THEMES = new Set(["modern", "aol90", "terminal", "future", "comic", "arcade", "space", "tavern", "cartoon80", "vhs", "newsroom", "coffee"]);
+const ALLOWED_ROOM_THEMES = new Set(["modern", "modernDark", "aol90", "terminal", "future", "comic", "arcade", "space", "tavern", "cartoon80", "vhs", "newsroom", "coffee", "nightclub", "wrestling", "superhero", "godzilla", "neumorph", "cinema"]);
 
 const validColor = (value: unknown) => {
 	const color = String(value || "").trim();
