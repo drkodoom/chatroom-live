@@ -218,6 +218,7 @@ type ClientMessage =
 	| { type: "admin_set_mod"; username?: string | null }
 	| { type: "admin_room_theme"; theme?: string | null }
 	| { type: "admin_confetti" }
+	| { type: "admin_effect"; effect?: string; target?: string | null; message?: string | null }
 	| { type: "admin_identity"; hideAdminBadge?: boolean; maskName?: string | null }
 	| { type: "staff_user_color"; username?: string; nameColor?: string | null }
 	| { type: "game_start"; game?: "hangman" | "boss" | "werewolf" | "rps_tournament"; phrase?: string; boss?: BossKey }
@@ -2010,6 +2011,35 @@ export class Chat extends Server<Env> {
 		if (parsed.type === "admin_confetti") {
 			if (!this.isAdmin(state)) return this.adminError(connection);
 			this.broadcast(JSON.stringify({ type: "confetti", actor: this.publicName(state), at: Date.now() }));
+			return;
+		}
+
+		if (parsed.type === "admin_effect") {
+			if (!this.isAdmin(state)) return this.adminError(connection);
+			const allowed = new Set([
+				"stop", "police_lights", "spotlight", "glitch", "earthquake", "fireworks", "hearts",
+				"emergency", "boo", "victory", "wanted", "jail", "disco", "godzilla", "news"
+			]);
+			const effect = String(parsed.effect || "").trim();
+			if (!allowed.has(effect)) return this.sendError(connection, "Unknown room effect.");
+			let target = parsed.target ? String(parsed.target).trim().slice(0, 40) : "";
+			let message = parsed.message ? String(parsed.message).trim().replace(/\s+/g, " ").slice(0, 180) : "";
+			const targeted = new Set(["spotlight", "boo", "victory", "wanted", "jail"]);
+			const needsMessage = new Set(["emergency", "news"]);
+			if (targeted.has(effect) && !target) return this.sendError(connection, "Choose a target member for that effect.");
+			if (needsMessage.has(effect) && !message) return this.sendError(connection, "That effect needs a message.");
+			if (target) {
+				const online = [...this.getConnections()].some((other) => this.publicName(other.state).toLowerCase() === target.toLowerCase());
+				if (!online) return this.sendError(connection, "That member is not currently online.");
+			}
+			this.broadcast(JSON.stringify({
+				type: "room_effect",
+				effect,
+				target: target || null,
+				message: message || null,
+				actor: this.publicName(state),
+				at: Date.now()
+			}));
 			return;
 		}
 
