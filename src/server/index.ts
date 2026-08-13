@@ -130,6 +130,7 @@ type ClientMessage =
 	| { type: "reaction"; id?: string; emoji?: string }
 	| { type: "typing"; active?: boolean }
 	| { type: "presence_status"; status?: string; statusText?: string }
+	| { type: "admin_clear_status"; username?: string }
 	| { type: "ping"; time?: number }
 	| { type: "clear_room" }
 	| { type: "admin_announcement"; content?: string }
@@ -1002,6 +1003,24 @@ export class Chat extends Server<Env> {
 			const statusText = String(parsed.statusText || "").trim().slice(0, 80);
 			connection.setState({ ...state, status, statusText });
 			this.broadcastPresence();
+			return;
+		}
+
+		if (parsed.type === "admin_clear_status") {
+			if (!this.isAdmin(state)) return this.adminError(connection);
+			const target = String(parsed.username || "").trim().toLowerCase();
+			if (!target) return;
+			let cleared = false;
+			for (const targetConnection of this.getConnections<ChatConnectionState>()) {
+				const targetState = targetConnection.state;
+				if (!targetState?.username) continue;
+				const matches = targetState.username.toLowerCase() === target || this.publicName(targetState).toLowerCase() === target;
+				if (!matches) continue;
+				targetConnection.setState({ ...targetState, status: "online", statusText: "" });
+				targetConnection.send(JSON.stringify({ type: "status_removed", actor: this.publicName(state) }));
+				cleared = true;
+			}
+			if (cleared) this.broadcastPresence();
 			return;
 		}
 
