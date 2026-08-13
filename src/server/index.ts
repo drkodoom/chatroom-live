@@ -42,6 +42,8 @@ const sanitizeFormat = (value: unknown): MessageFormat => {
 type ChatConnectionState = {
 	username: string;
 	role: string;
+	displayName: string;
+	hideAdminBadge: boolean;
 	joinedAt: number;
 	status: "online" | "away" | "busy";
 	statusText: string;
@@ -51,6 +53,8 @@ type ChatConnectionState = {
 };
 
 type StoredMessage = ChatMessage & {
+	displayUser: string;
+	displayRole: "user" | "mod" | "admin";
 	format: MessageFormat;
 	replyTo: string | null;
 	createdAt: number;
@@ -110,6 +114,9 @@ type BossGame = {
 	bossHp: number;
 	bossMaxHp: number;
 	players: Record<string, BattlePlayer>;
+	turnOrder: string[];
+	turnIndex: number;
+	round: number;
 	log: string[];
 	startedAt: number;
 };
@@ -137,10 +144,12 @@ type ClientMessage =
 	| { type: "admin_set_mod"; username?: string | null }
 	| { type: "admin_room_theme"; theme?: string | null }
 	| { type: "admin_confetti" }
+	| { type: "admin_identity"; hideAdminBadge?: boolean; maskName?: string | null }
 	| { type: "staff_user_color"; username?: string; nameColor?: string | null }
 	| { type: "game_start"; game?: "hangman" | "boss"; phrase?: string; boss?: BossKey }
 	| { type: "game_hangman_guess"; guess?: string }
 	| { type: "game_boss_attack" }
+	| { type: "game_boss_skip" }
 	| { type: "game_end" };
 
 export class Chat extends Server<Env> {
@@ -227,6 +236,8 @@ export class Chat extends Server<Env> {
 			(this.ctx.storage.sql.exec(`PRAGMA table_info(messages)`).toArray() as Array<{ name: string }>).map((row) => row.name),
 		);
 		const additions: Array<[string, string]> = [
+			["display_user", "TEXT"],
+			["display_role", "TEXT"],
 			["format_json", "TEXT NOT NULL DEFAULT '{}'"],
 			["reply_to", "TEXT"],
 			["created_at", "INTEGER NOT NULL DEFAULT 0"],
@@ -261,10 +272,15 @@ export class Chat extends Server<Env> {
 			LIMIT ${HISTORY_LIMIT}
 		`).toArray() as Array<Record<string, unknown>>;
 
-		this.messages = rows.reverse().map((row) => ({
+		this.messages = rows.reverse().map((row) => {
+			const ownerRole = ["admin", "mod"].includes(String(row.role || "user")) ? String(row.role) as "admin" | "mod" : "user";
+			const publicRole = ["admin", "mod"].includes(String(row.display_role || ownerRole)) ? String(row.display_role || ownerRole) as "admin" | "mod" : "user";
+			return {
 			id: String(row.id || ""),
 			user: String(row.user || ""),
-			role: ["admin", "mod"].includes(String(row.role || "user")) ? String(row.role) as "admin" | "mod" : "user",
+			role: ownerRole,
+			displayUser: String(row.display_user || row.user || ""),
+			displayRole: publicRole,
 			content: String(row.content || ""),
 			format: this.parseFormat(row.format_json),
 			replyTo: row.reply_to ? String(row.reply_to) : null,
@@ -272,7 +288,8 @@ export class Chat extends Server<Env> {
 			updatedAt: row.updated_at == null ? null : Number(row.updated_at),
 			deleted: Number(row.deleted) === 1,
 			highlightColor: validColor(row.highlight_color),
-		}));
+		};
+		});
 
 		const profileRows = this.ctx.storage.sql.exec(`SELECT username, name_color, badge FROM profiles`).toArray() as Array<Record<string, unknown>>;
 		this.profiles.clear();
@@ -306,6 +323,11 @@ export class Chat extends Server<Env> {
 		const gameRow = (this.ctx.storage.sql.exec(`SELECT state_json FROM game_state WHERE id = 1`).toArray()[0] || {}) as Record<string, unknown>;
 		try {
 			this.game = gameRow.state_json ? JSON.parse(String(gameRow.state_json)) as GameState : null;
+			if (this.game?.type === "boss") {
+				if (!Array.isArray(this.game.turnOrder)) this.game.turnOrder = Object.keys(this.game.players || {});
+				if (!Number.isInteger(this.game.turnIndex) || this.game.turnIndex < 0 || this.game.turnIndex >= Math.max(1, this.game.turnOrder.length)) this.game.turnIndex = 0;
+				if (!Number.isInteger(this.game.round) || this.game.round < 1) this.game.round = 1;
+			}
 		} catch {
 			this.game = null;
 		}
@@ -331,7 +353,16 @@ export class Chat extends Server<Env> {
 
 	serializeMessage(message: StoredMessage) {
 		return {
-			...message,
+			id: message.id,
+			content: message.content,
+			user: message.displayUser || message.user,
+			role: message.displayRole || message.role,
+			format: message.format,
+			replyTo: message.replyTo,
+			createdAt: message.createdAt,
+			updatedAt: message.updatedAt,
+			deleted: message.deleted,
+			highlightColor: message.highlightColor,
 			pinned: this.settings.pinnedMessageIds.includes(message.id),
 			reactions: this.getReactionSummary(message.id),
 		};
@@ -348,6 +379,35 @@ export class Chat extends Server<Env> {
 
 	isAdmin(state: ChatConnectionState | null | undefined) {
 		return state?.role === "admin";
+	}
+
+	publicName(state: ChatConnectionState | null | undefined) {
+		return state?.displayName || state?.username || "Unknown";
+	}
+
+	publicRole(state: ChatConnectionState | null | undefined): "user" | "mod" | "admin" {
+		if (this.isAdmin(state)) return state?.hideAdminBadge ? "user" : "admin";
+		if (this.isMod(state)) return "mod";
+		return "user";
+	}
+
+	validMaskName(value: unknown) {
+		const name = String(value || "").trim().replace(/\s+/g, " ").slice(0, 24);
+		if (!name) return null;
+		return /^[A-Za-z0-9_. -]{2,24}$/.test(name) ? name : undefined;
+	}
+
+	maskNameAvailable(name: string, selfUsername: string) {
+		const key = name.toLowerCase();
+		for (const profile of this.profiles.values()) {
+			if (profile.username.toLowerCase() === key && profile.username.toLowerCase() !== selfUsername.toLowerCase()) return false;
+		}
+		for (const connection of this.getConnections<ChatConnectionState>()) {
+			const other = connection.state;
+			if (!other || other.username.toLowerCase() === selfUsername.toLowerCase()) continue;
+			if (other.username.toLowerCase() === key || this.publicName(other).toLowerCase() === key) return false;
+		}
+		return true;
 	}
 
 	isMod(state: ChatConnectionState | null | undefined) {
@@ -440,9 +500,15 @@ export class Chat extends Server<Env> {
 				startedAt: this.game.startedAt,
 			};
 		}
+		const currentKey = this.game.turnOrder?.[this.game.turnIndex] || null;
+		const currentPlayer = currentKey ? this.game.players[currentKey] : null;
 		return {
 			...this.game,
 			players: Object.values(this.game.players),
+			turnOrder: undefined,
+			turnIndex: undefined,
+			currentTurn: currentPlayer?.username || null,
+			round: this.game.round || 1,
 		};
 	}
 
@@ -465,8 +531,40 @@ export class Chat extends Server<Env> {
 		player.effects.push(effect);
 	}
 
-	startBossGame(host: string, bossKey: BossKey) {
-		const online = Math.max(1, this.getOnlineUsers().length);
+	getUniqueConnectionStates() {
+		const users = new Map<string, ChatConnectionState>();
+		for (const connection of this.getConnections<ChatConnectionState>()) {
+			const state = connection.state;
+			if (!state?.username) continue;
+			const key = state.username.toLowerCase();
+			const existing = users.get(key);
+			if (!existing || state.joinedAt < existing.joinedAt) users.set(key, state);
+		}
+		return Array.from(users.values()).sort((a, b) => a.joinedAt - b.joinedAt);
+	}
+
+	newBattlePlayer(state: ChatConnectionState): BattlePlayer {
+		return {
+			username: this.publicName(state),
+			hp: 45,
+			maxHp: 45,
+			attacks: 0,
+			damageDealt: 0,
+			crits: 0,
+			lastActionAt: 0,
+			effects: [],
+		};
+	}
+
+	startBossGame(hostState: ChatConnectionState, bossKey: BossKey) {
+		const states = this.getUniqueConnectionStates();
+		const hostKey = hostState.username.toLowerCase();
+		states.sort((a, b) => {
+			if (a.username.toLowerCase() === hostKey) return -1;
+			if (b.username.toLowerCase() === hostKey) return 1;
+			return a.joinedAt - b.joinedAt;
+		});
+		const online = Math.max(1, states.length);
 		const defs: Record<BossKey, { name: string; baseHp: number; perPlayer: number }> = {
 			mad_dragon: { name: "Mad Dragon", baseHp: 180, perPlayer: 35 },
 			goblin_king: { name: "Goblin King", baseHp: 150, perPlayer: 30 },
@@ -474,21 +572,67 @@ export class Chat extends Server<Env> {
 		};
 		const def = defs[bossKey];
 		const hp = def.baseHp + Math.max(0, online - 1) * def.perPlayer;
+		const players: Record<string, BattlePlayer> = {};
+		const turnOrder: string[] = [];
+		for (const playerState of states) {
+			const key = playerState.username.toLowerCase();
+			players[key] = this.newBattlePlayer(playerState);
+			turnOrder.push(key);
+		}
+		if (!turnOrder.length) {
+			players[hostKey] = this.newBattlePlayer(hostState);
+			turnOrder.push(hostKey);
+		}
 		this.game = {
 			type: "boss",
 			status: "active",
-			host,
+			host: this.publicName(hostState),
 			bossKey,
 			bossName: def.name,
 			bossHp: hp,
 			bossMaxHp: hp,
-			players: {},
-			log: [`${host} summoned the ${def.name}. Type /roll in chat to roll a d20 and attack!`],
+			players,
+			turnOrder,
+			turnIndex: 0,
+			round: 1,
+			log: [`${this.publicName(hostState)} summoned the ${def.name}. ${players[turnOrder[0]]?.username || "A player"} goes first. Type /roll only when it is your turn.`],
 			startedAt: Date.now(),
 		};
 		this.saveGame();
 		this.broadcastGame();
-		this.broadcastGameEvent(`${host} summoned the ${def.name}. Type /roll to attack.`, "critical");
+		this.broadcastGameEvent(`${this.publicName(hostState)} summoned the ${def.name}. ${players[turnOrder[0]]?.username || "A player"} goes first.`, "critical");
+	}
+
+	ensureBossPlayer(game: BossGame, state: ChatConnectionState) {
+		const key = state.username.toLowerCase();
+		if (!game.players[key]) {
+			game.players[key] = this.newBattlePlayer(state);
+			game.turnOrder.push(key);
+			this.addGameLog(`${this.publicName(state)} joins the battle and enters the turn order.`);
+		} else {
+			game.players[key].username = this.publicName(state);
+		}
+		return game.players[key];
+	}
+
+	advanceBossTurn(game: BossGame) {
+		if (!game.turnOrder.length) return null;
+		const total = game.turnOrder.length;
+		for (let step = 1; step <= total; step += 1) {
+			const nextIndex = (game.turnIndex + step) % total;
+			const key = game.turnOrder[nextIndex];
+			const player = game.players[key];
+			if (!player || player.hp <= 0 || !this.isUsernameOnline(key)) continue;
+			if (nextIndex <= game.turnIndex) game.round = Math.max(1, (game.round || 1) + 1);
+			game.turnIndex = nextIndex;
+			return player;
+		}
+		return null;
+	}
+
+	currentBossPlayer(game: BossGame) {
+		const key = game.turnOrder?.[game.turnIndex];
+		return key ? game.players[key] || null : null;
 	}
 
 	bossAttack(game: BossGame, player: BattlePlayer) {
@@ -606,31 +750,21 @@ export class Chat extends Server<Env> {
 		return modifier;
 	}
 
-	bossBattleAttack(username: string, connection: Connection) {
+	bossBattleAttack(state: ChatConnectionState, connection: Connection) {
 		if (!this.game || this.game.type !== "boss" || this.game.status !== "active") return this.sendError(connection, "No boss battle is active.");
 		const game = this.game;
-		const key = username.toLowerCase();
-		let player = game.players[key];
-		if (!player) {
-			player = {
-				username,
-				hp: 45,
-				maxHp: 45,
-				attacks: 0,
-				damageDealt: 0,
-				crits: 0,
-				lastActionAt: 0,
-				effects: [],
-			};
-			game.players[key] = player;
-			this.addGameLog(`${username} joins the battle with 45 HP.`);
-		}
+		const key = state.username.toLowerCase();
+		const player = this.ensureBossPlayer(game, state);
+		const currentKey = game.turnOrder?.[game.turnIndex];
+		const currentPlayer = currentKey ? game.players[currentKey] : null;
+		if (currentKey && currentKey !== key) return this.sendError(connection, `It is ${currentPlayer?.username || "another player's"} turn. Wait for your turn.`);
 		if (player.hp <= 0) return this.sendError(connection, "You are knocked out for the rest of this battle.");
-		if (Date.now() - player.lastActionAt < 1200) return this.sendError(connection, "Wait a moment before attacking again.");
 
 		const modifier = this.processPlayerEffects(player);
 		if (player.hp <= 0) {
-			this.addGameLog(`${username} falls before they can attack.`);
+			this.addGameLog(`${player.username} falls before they can attack.`);
+			const next = this.advanceBossTurn(game);
+			if (next) this.addGameLog(`It is now ${next.username}'s turn.`);
 			this.saveGame();
 			this.broadcastGame();
 			return;
@@ -639,7 +773,7 @@ export class Chat extends Server<Env> {
 		const rawRoll = this.randomInt(1, 20);
 		const totalRoll = rawRoll + modifier;
 		let damage = 0;
-		let attackText = `${username} rolls ${rawRoll}`;
+		let attackText = `${player.username} rolls ${rawRoll}`;
 		if (modifier) attackText += ` (${modifier > 0 ? "+" : ""}${modifier} = ${totalRoll})`;
 
 		if (rawRoll === 1) {
@@ -689,6 +823,13 @@ export class Chat extends Server<Env> {
 			const lossText = `The party has fallen. ${game.bossName} wins.`;
 			this.addGameLog(lossText);
 			this.broadcastGameEvent(lossText, "bad");
+		} else {
+			const next = this.advanceBossTurn(game);
+			if (next) {
+				const nextText = `Round ${game.round}: ${next.username}'s turn.`;
+				this.addGameLog(nextText);
+				this.broadcastGameEvent(nextText, "normal");
+			}
 		}
 		this.saveGame();
 		this.broadcastGame();
@@ -709,12 +850,12 @@ export class Chat extends Server<Env> {
 	presenceEntry(state: ChatConnectionState) {
 		const profile = this.profiles.get(state.username.toLowerCase());
 		return {
-			username: state.username,
+			username: this.publicName(state),
 			status: state.status,
 			statusText: state.statusText,
 			nameColor: profile?.nameColor ?? state.nameColor ?? null,
 			badge: profile?.badge ?? state.badge ?? "",
-			role: this.effectiveRole(state),
+			role: this.publicRole(state),
 		};
 	}
 
@@ -771,6 +912,8 @@ export class Chat extends Server<Env> {
 		connection.setState({
 			username,
 			role,
+			displayName: username,
+			hideAdminBadge: false,
 			joinedAt: Date.now(),
 			status: "online",
 			statusText: "",
@@ -785,9 +928,16 @@ export class Chat extends Server<Env> {
 			profiles: this.getProfileMap(),
 			settings: this.settings,
 			game: this.publicGameState(),
+			identity: { displayName: username, hideAdminBadge: false },
 		}));
 
-		if (!alreadyOnline) this.broadcastSystem("join", username);
+		const connectedState = connection.state as ChatConnectionState;
+		if (this.game?.type === "boss" && this.game.status === "active") {
+			this.ensureBossPlayer(this.game, connectedState);
+			this.saveGame();
+			this.broadcastGame();
+		}
+		if (!alreadyOnline) this.broadcastSystem("join", this.publicName(connectedState));
 		this.broadcastPresence();
 	}
 
@@ -797,9 +947,18 @@ export class Chat extends Server<Env> {
 		if (!username) return;
 		const stillOnline = this.isUsernameOnline(username, connection.id);
 		if (!stillOnline) {
-			this.broadcastSystem("leave", username);
+			this.broadcastSystem("leave", this.publicName(state));
 			if (this.settings.modUsername && this.settings.modUsername.toLowerCase() === username.toLowerCase()) {
 				this.setModerator(null, "system");
+			}
+			if (this.game?.type === "boss" && this.game.status === "active") {
+				const currentKey = this.game.turnOrder?.[this.game.turnIndex];
+				if (currentKey === username.toLowerCase()) {
+					const next = this.advanceBossTurn(this.game);
+					if (next) this.addGameLog(`${this.publicName(state)} left. It is now ${next.username}'s turn.`);
+					this.saveGame();
+					this.broadcastGame();
+				}
 			}
 		}
 		this.broadcastPresence(connection.id);
@@ -834,7 +993,7 @@ export class Chat extends Server<Env> {
 		}
 
 		if (parsed.type === "typing") {
-			this.broadcast(JSON.stringify({ type: "typing", username: state.username, active: Boolean(parsed.active) }));
+			this.broadcast(JSON.stringify({ type: "typing", username: this.publicName(state), active: Boolean(parsed.active) }));
 			return;
 		}
 
@@ -853,7 +1012,7 @@ export class Chat extends Server<Env> {
 			this.messages = [];
 			this.settings.pinnedMessageIds = [];
 			this.saveRoomSettings();
-			this.broadcast(JSON.stringify({ type: "clear_room", username: state.username }));
+			this.broadcast(JSON.stringify({ type: "clear_room", username: this.publicName(state) }));
 			this.broadcastSettings();
 			return;
 		}
@@ -862,7 +1021,7 @@ export class Chat extends Server<Env> {
 			if (!this.isStaff(state)) return this.staffError(connection);
 			const content = String(parsed.content || "").trim().slice(0, 500);
 			if (!content) return;
-			this.broadcast(JSON.stringify({ type: "admin_announcement", username: state.username, role: this.effectiveRole(state), content }));
+			this.broadcast(JSON.stringify({ type: "admin_announcement", username: this.publicName(state), role: this.publicRole(state), content }));
 			return;
 		}
 
@@ -887,7 +1046,7 @@ export class Chat extends Server<Env> {
 				}
 			}
 			if (!kicked) return this.sendError(connection, `${target} is not currently online.`);
-			this.broadcastSystem("kick", target, state.username);
+			this.broadcastSystem("kick", target, this.publicName(state));
 			this.broadcastPresence();
 			return;
 		}
@@ -904,7 +1063,7 @@ export class Chat extends Server<Env> {
 				 ON CONFLICT(username) DO UPDATE SET muted_until = excluded.muted_until, muted_by = excluded.muted_by, reason = excluded.reason`,
 				target, until, state.username, reason,
 			);
-			this.broadcastSystem("mute", target, state.username, { until });
+			this.broadcastSystem("mute", target, this.publicName(state), { until });
 			return;
 		}
 
@@ -913,7 +1072,7 @@ export class Chat extends Server<Env> {
 			const target = String(parsed.username || "").trim();
 			if (!target) return;
 			this.ctx.storage.sql.exec(`DELETE FROM mutes WHERE lower(username) = lower(?)`, target);
-			this.broadcastSystem("unmute", target, state.username);
+			this.broadcastSystem("unmute", target, this.publicName(state));
 			return;
 		}
 
@@ -968,13 +1127,46 @@ export class Chat extends Server<Env> {
 			this.settings.roomTheme = requested;
 			this.saveRoomSettings();
 			this.broadcastSettings();
-			this.broadcast(JSON.stringify({ type: "room_theme", theme: requested, actor: state.username }));
+			this.broadcast(JSON.stringify({ type: "room_theme", theme: requested, actor: this.publicName(state) }));
 			return;
 		}
 
 		if (parsed.type === "admin_confetti") {
 			if (!this.isAdmin(state)) return this.adminError(connection);
-			this.broadcast(JSON.stringify({ type: "confetti", actor: state.username, at: Date.now() }));
+			this.broadcast(JSON.stringify({ type: "confetti", actor: this.publicName(state), at: Date.now() }));
+			return;
+		}
+
+		if (parsed.type === "admin_identity") {
+			if (!this.isAdmin(state)) return this.adminError(connection);
+			const requestedMask = this.validMaskName(parsed.maskName);
+			if (requestedMask === undefined) return this.sendError(connection, "Mask names must be 2-24 characters using letters, numbers, spaces, periods, underscores, or hyphens.");
+			const displayName = requestedMask || state.username;
+			if (displayName.toLowerCase() !== state.username.toLowerCase() && !this.maskNameAvailable(displayName, state.username)) {
+				return this.sendError(connection, "That disguise name is already in use or belongs to another known member.");
+			}
+			const hideAdminBadge = Boolean(parsed.hideAdminBadge);
+			for (const other of this.getConnections<ChatConnectionState>()) {
+				if (other.state?.username?.toLowerCase() !== state.username.toLowerCase()) continue;
+				other.setState({ ...other.state, displayName, hideAdminBadge });
+				other.send(JSON.stringify({ type: "admin_identity", displayName, hideAdminBadge }));
+			}
+			this.broadcastPresence();
+			const publicRole = hideAdminBadge ? "user" : "admin";
+			for (const message of this.messages) {
+				if (message.user.toLowerCase() !== state.username.toLowerCase()) continue;
+				message.displayUser = displayName;
+				message.displayRole = publicRole;
+				this.ctx.storage.sql.exec(`UPDATE messages SET display_user = ?, display_role = ? WHERE id = ?`, displayName, publicRole, message.id);
+				this.broadcast(JSON.stringify({ type: "message_update", message: this.serializeMessage(message) }));
+			}
+			if (this.game?.type === "boss") {
+				const player = this.game.players[state.username.toLowerCase()];
+				if (player) player.username = displayName;
+				if (this.game.host.toLowerCase() === state.username.toLowerCase() || this.game.host.toLowerCase() === this.publicName(state).toLowerCase()) this.game.host = displayName;
+				this.saveGame();
+				this.broadcastGame();
+			}
 			return;
 		}
 
@@ -1003,7 +1195,7 @@ export class Chat extends Server<Env> {
 				if (target.toLowerCase() === state.username.toLowerCase()) return this.sendError(connection, "The administrator already has all moderator powers.");
 				if (!this.isUsernameOnline(target)) return this.sendError(connection, `${target} must be online to become MOD.`);
 			}
-			this.setModerator(target, state.username);
+			this.setModerator(target, this.publicName(state));
 			return;
 		}
 
@@ -1042,23 +1234,23 @@ export class Chat extends Server<Env> {
 				this.game = {
 					type: "hangman",
 					status: "active",
-					host: state.username,
+					host: this.publicName(state),
 					phrase,
 					guessed: [],
 					wrong: 0,
 					maxWrong: 6,
 					winner: null,
-					log: [`${state.username} started Hangman.`],
+					log: [`${this.publicName(state)} started Hangman.`],
 					startedAt: Date.now(),
 				};
 				this.saveGame();
 				this.broadcastGame();
-				this.broadcastGameEvent(`${state.username} started Hangman.`, "critical");
+				this.broadcastGameEvent(`${this.publicName(state)} started Hangman.`, "critical");
 				return;
 			}
 			if (parsed.game === "boss") {
 				const boss = ["mad_dragon", "goblin_king", "evil_wizard"].includes(String(parsed.boss)) ? parsed.boss as BossKey : "mad_dragon";
-				this.startBossGame(state.username, boss);
+				this.startBossGame(state, boss);
 				return;
 			}
 			return this.sendError(connection, "Choose a game to start.");
@@ -1067,10 +1259,9 @@ export class Chat extends Server<Env> {
 		if (parsed.type === "game_end") {
 			if (!this.isStaff(state)) return this.staffError(connection);
 			if (!this.game) return;
-			const endText = `${state.username} ended the game.`;
-			this.addGameLog(endText);
+			const endText = `${this.publicName(state)} cleared the game from the room.`;
 			this.broadcastGameEvent(endText, "normal");
-			this.game.status = "ended";
+			this.game = null;
 			this.saveGame();
 			this.broadcastGame();
 			return;
@@ -1085,28 +1276,28 @@ export class Chat extends Server<Env> {
 			if (guess.length === 1 && /[A-Z0-9]/.test(guess)) {
 				if (game.guessed.includes(guess)) return this.sendError(connection, `${guess} was already guessed.`);
 				game.guessed.push(guess);
-				if (normalizedPhrase.includes(guess)) this.addGameLog(`${state.username} guessed ${guess} — correct!`);
+				if (normalizedPhrase.includes(guess)) this.addGameLog(`${this.publicName(state)} guessed ${guess} — correct!`);
 				else {
 					game.wrong += 1;
-					this.addGameLog(`${state.username} guessed ${guess} — nope. (${game.wrong}/${game.maxWrong})`);
+					this.addGameLog(`${this.publicName(state)} guessed ${guess} — nope. (${game.wrong}/${game.maxWrong})`);
 				}
 			} else {
 				const normalizedGuess = guess.replace(/\s+/g, " ").trim();
 				if (normalizedGuess === normalizedPhrase) {
 					game.status = "won";
-					game.winner = state.username;
-					this.addGameLog(`${state.username} solved it: ${game.phrase}`);
+					game.winner = this.publicName(state);
+					this.addGameLog(`${this.publicName(state)} solved it: ${game.phrase}`);
 				} else {
 					game.wrong += 1;
-					this.addGameLog(`${state.username} guessed the phrase incorrectly. (${game.wrong}/${game.maxWrong})`);
+					this.addGameLog(`${this.publicName(state)} guessed the phrase incorrectly. (${game.wrong}/${game.maxWrong})`);
 				}
 			}
 			if (game.status === "active") {
 				const needed = Array.from(normalizedPhrase).filter((char) => /[A-Z0-9]/.test(char));
 				if (needed.every((char) => game.guessed.includes(char))) {
 					game.status = "won";
-					game.winner = state.username;
-					this.addGameLog(`${state.username} completed the phrase: ${game.phrase}`);
+					game.winner = this.publicName(state);
+					this.addGameLog(`${this.publicName(state)} completed the phrase: ${game.phrase}`);
 				} else if (game.wrong >= game.maxWrong) {
 					game.status = "lost";
 					this.addGameLog(`Hangman is over. The answer was: ${game.phrase}`);
@@ -1120,7 +1311,20 @@ export class Chat extends Server<Env> {
 		}
 
 		if (parsed.type === "game_boss_attack") {
-			this.bossBattleAttack(state.username, connection);
+			this.bossBattleAttack(state, connection);
+			return;
+		}
+
+		if (parsed.type === "game_boss_skip") {
+			if (!this.isStaff(state)) return this.staffError(connection);
+			if (!this.game || this.game.type !== "boss" || this.game.status !== "active") return this.sendError(connection, "No boss battle is active.");
+			const current = this.currentBossPlayer(this.game);
+			if (!current) return;
+			this.addGameLog(`${this.publicName(state)} skipped ${current.username}'s turn.`);
+			const next = this.advanceBossTurn(this.game);
+			if (next) this.addGameLog(`Round ${this.game.round}: ${next.username}'s turn.`);
+			this.saveGame();
+			this.broadcastGame();
 			return;
 		}
 
@@ -1189,7 +1393,7 @@ export class Chat extends Server<Env> {
 
 		const commandContent = String(parsed.content || "").trim();
 		if (commandContent.toLowerCase() === "/roll") {
-			this.bossBattleAttack(state.username, connection);
+			this.bossBattleAttack(state, connection);
 			return;
 		}
 
@@ -1219,6 +1423,8 @@ export class Chat extends Server<Env> {
 			content,
 			user: state.username,
 			role: this.effectiveRole(state),
+			displayUser: this.publicName(state),
+			displayRole: this.publicRole(state),
 			format,
 			replyTo,
 			createdAt: now,
@@ -1230,9 +1436,9 @@ export class Chat extends Server<Env> {
 		this.messages.push(cleanMessage);
 		if (this.messages.length > HISTORY_LIMIT) this.messages = this.messages.slice(-HISTORY_LIMIT);
 		this.ctx.storage.sql.exec(
-			`INSERT INTO messages (id, user, role, content, format_json, reply_to, created_at, updated_at, deleted, highlight_color)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL)`,
-			cleanMessage.id, cleanMessage.user, cleanMessage.role, cleanMessage.content,
+			`INSERT INTO messages (id, user, role, display_user, display_role, content, format_json, reply_to, created_at, updated_at, deleted, highlight_color)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL)`,
+			cleanMessage.id, cleanMessage.user, cleanMessage.role, cleanMessage.displayUser, cleanMessage.displayRole, cleanMessage.content,
 			JSON.stringify(cleanMessage.format), cleanMessage.replyTo, cleanMessage.createdAt,
 		);
 		connection.setState({ ...state, lastMessageAt: now });
