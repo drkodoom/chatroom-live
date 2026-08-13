@@ -12,6 +12,7 @@ const ALLOWED_ORIGIN = "https://drkodoom.github.io";
 const HISTORY_LIMIT = 100;
 const EDIT_WINDOW_MS = 10 * 60 * 1000;
 const ALLOWED_REACTIONS = new Set(["👍", "❤️", "😂", "😮", "👎"]);
+const ALLOWED_ROOM_THEMES = new Set(["modern", "aol90", "terminal", "future", "comic", "arcade"]);
 
 const validColor = (value: unknown) => {
 	const color = String(value || "").trim();
@@ -64,6 +65,7 @@ type RoomSettings = {
 	locked: boolean;
 	banner: string;
 	modUsername: string | null;
+	roomTheme: string | null;
 };
 
 type GameEffect = {
@@ -133,6 +135,8 @@ type ClientMessage =
 	| { type: "admin_room_settings"; slowModeSeconds?: number; locked?: boolean }
 	| { type: "admin_user_style"; username?: string; nameColor?: string | null; badge?: string }
 	| { type: "admin_set_mod"; username?: string | null }
+	| { type: "admin_room_theme"; theme?: string | null }
+	| { type: "admin_confetti" }
 	| { type: "staff_user_color"; username?: string; nameColor?: string | null }
 	| { type: "game_start"; game?: "hangman" | "boss"; phrase?: string; boss?: BossKey }
 	| { type: "game_hangman_guess"; guess?: string }
@@ -150,6 +154,7 @@ export class Chat extends Server<Env> {
 		locked: false,
 		banner: "",
 		modUsername: null,
+		roomTheme: null,
 	};
 	game: GameState = null;
 
@@ -244,6 +249,9 @@ export class Chat extends Server<Env> {
 		if (!columns.has("mod_username")) {
 			this.ctx.storage.sql.exec(`ALTER TABLE room_settings ADD COLUMN mod_username TEXT`);
 		}
+		if (!columns.has("room_theme")) {
+			this.ctx.storage.sql.exec(`ALTER TABLE room_settings ADD COLUMN room_theme TEXT`);
+		}
 	}
 
 	loadState() {
@@ -292,6 +300,7 @@ export class Chat extends Server<Env> {
 			locked: Number(settings?.locked) === 1,
 			banner: String(settings?.banner || ""),
 			modUsername: settings?.mod_username ? String(settings.mod_username) : null,
+			roomTheme: ALLOWED_ROOM_THEMES.has(String(settings?.room_theme || "")) ? String(settings.room_theme) : null,
 		};
 
 		const gameRow = (this.ctx.storage.sql.exec(`SELECT state_json FROM game_state WHERE id = 1`).toArray()[0] || {}) as Record<string, unknown>;
@@ -362,7 +371,7 @@ export class Chat extends Server<Env> {
 	saveRoomSettings() {
 		this.ctx.storage.sql.exec(
 			`UPDATE room_settings
-			 SET pinned_message_ids_json = ?, pinned_message_id = ?, slow_mode_seconds = ?, locked = ?, banner = ?, mod_username = ?
+			 SET pinned_message_ids_json = ?, pinned_message_id = ?, slow_mode_seconds = ?, locked = ?, banner = ?, mod_username = ?, room_theme = ?
 			 WHERE id = 1`,
 			JSON.stringify(this.settings.pinnedMessageIds.slice(0, 2)),
 			this.settings.pinnedMessageIds[0] || null,
@@ -370,6 +379,7 @@ export class Chat extends Server<Env> {
 			this.settings.locked ? 1 : 0,
 			this.settings.banner,
 			this.settings.modUsername,
+			this.settings.roomTheme,
 		);
 	}
 
@@ -948,6 +958,23 @@ export class Chat extends Server<Env> {
 			if (parsed.locked != null) this.settings.locked = Boolean(parsed.locked);
 			this.saveRoomSettings();
 			this.broadcastSettings();
+			return;
+		}
+
+		if (parsed.type === "admin_room_theme") {
+			if (!this.isAdmin(state)) return this.adminError(connection);
+			const requested = parsed.theme ? String(parsed.theme) : null;
+			if (requested && !ALLOWED_ROOM_THEMES.has(requested)) return this.sendError(connection, "Unknown room theme.");
+			this.settings.roomTheme = requested;
+			this.saveRoomSettings();
+			this.broadcastSettings();
+			this.broadcast(JSON.stringify({ type: "room_theme", theme: requested, actor: state.username }));
+			return;
+		}
+
+		if (parsed.type === "admin_confetti") {
+			if (!this.isAdmin(state)) return this.adminError(connection);
+			this.broadcast(JSON.stringify({ type: "confetti", actor: state.username, at: Date.now() }));
 			return;
 		}
 
