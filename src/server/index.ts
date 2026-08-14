@@ -1709,6 +1709,8 @@ export class Chat extends Server<Env> {
 		const role = context.request.headers.get("x-chat-role") || "user";
 		const nameColor = validColor(context.request.headers.get("x-chat-name-color"));
 		const badge = validBadge(context.request.headers.get("x-chat-badge"));
+		let explicitEntry = false;
+		try { explicitEntry = new URL(context.request.url).searchParams.get("entry") === "1"; } catch {}
 		let entrance: Record<string, unknown> | null = null;
 		try {
 			const rawEntrance = context.request.headers.get("x-chat-entrance");
@@ -1765,15 +1767,15 @@ export class Chat extends Server<Env> {
 		}
 		if (!alreadyOnline) {
 			this.broadcastSystem("join", this.publicName(connectedState));
-			const entranceConfig = connectedState.entrance as any;
-			if (entranceConfig?.tier && entranceConfig.tier !== "none" && entranceConfig?.config?.enabled) {
-				this.broadcast(JSON.stringify({
-					type: "entrance",
-					username: this.publicName(connectedState),
-					entrance: entranceConfig,
-					at: Date.now()
-				}));
-			}
+		}
+		const entranceConfig = connectedState.entrance as any;
+		if ((explicitEntry || !alreadyOnline) && entranceConfig?.tier && entranceConfig.tier !== "none" && entranceConfig?.config?.enabled) {
+			this.broadcast(JSON.stringify({
+				type: "entrance",
+				username: this.publicName(connectedState),
+				entrance: entranceConfig,
+				at: Date.now()
+			}));
 		}
 		this.broadcastPresence();
 	}
