@@ -50,6 +50,7 @@ type ChatConnectionState = {
 	nameColor: string | null;
 	badge: string;
 	lastMessageAt: number;
+	entrance: Record<string, unknown> | null;
 };
 
 type StoredMessage = ChatMessage & {
@@ -219,6 +220,7 @@ type ClientMessage =
 	| { type: "admin_room_theme"; theme?: string | null }
 	| { type: "admin_confetti" }
 	| { type: "admin_effect"; effect?: string; target?: string | null; message?: string | null }
+	| { type: "admin_trigger_entrance"; username?: string }
 	| { type: "admin_identity"; hideAdminBadge?: boolean; maskName?: string | null }
 	| { type: "staff_user_color"; username?: string; nameColor?: string | null }
 	| { type: "game_start"; game?: "hangman" | "boss" | "werewolf" | "rps_tournament"; phrase?: string; boss?: BossKey }
@@ -1707,6 +1709,13 @@ export class Chat extends Server<Env> {
 		const role = context.request.headers.get("x-chat-role") || "user";
 		const nameColor = validColor(context.request.headers.get("x-chat-name-color"));
 		const badge = validBadge(context.request.headers.get("x-chat-badge"));
+		let entrance: Record<string, unknown> | null = null;
+		try {
+			const rawEntrance = context.request.headers.get("x-chat-entrance");
+			if (rawEntrance) entrance = JSON.parse(decodeURIComponent(rawEntrance)) as Record<string, unknown>;
+		} catch {
+			entrance = null;
+		}
 
 		if (!username) {
 			connection.close(1008, "Unauthorized");
@@ -1732,6 +1741,7 @@ export class Chat extends Server<Env> {
 			nameColor,
 			badge,
 			lastMessageAt: 0,
+			entrance,
 		});
 
 		connection.send(JSON.stringify({
@@ -1753,7 +1763,18 @@ export class Chat extends Server<Env> {
 			this.sendWerewolfSecret(connection);
 			this.broadcastGame();
 		}
-		if (!alreadyOnline) this.broadcastSystem("join", this.publicName(connectedState));
+		if (!alreadyOnline) {
+			this.broadcastSystem("join", this.publicName(connectedState));
+			const entranceConfig = connectedState.entrance as any;
+			if (entranceConfig?.tier && entranceConfig.tier !== "none" && entranceConfig?.config?.enabled) {
+				this.broadcast(JSON.stringify({
+					type: "entrance",
+					username: this.publicName(connectedState),
+					entrance: entranceConfig,
+					at: Date.now()
+				}));
+			}
+		}
 		this.broadcastPresence();
 	}
 
@@ -2037,6 +2058,29 @@ export class Chat extends Server<Env> {
 				effect,
 				target: target || null,
 				message: message || null,
+				actor: this.publicName(state),
+				at: Date.now()
+			}));
+			return;
+		}
+
+		if (parsed.type === "admin_trigger_entrance") {
+			if (!this.isAdmin(state)) return this.adminError(connection);
+			const requested = String(parsed.username || "").trim();
+			if (!requested) return this.sendError(connection, "Choose an online member.");
+			const targetConnection = [...this.getConnections<ChatConnectionState>()].find((other) => {
+				const otherState = other.state;
+				if (!otherState) return false;
+				return otherState.username.toLowerCase() === requested.toLowerCase() || this.publicName(otherState).toLowerCase() === requested.toLowerCase();
+			});
+			if (!targetConnection?.state) return this.sendError(connection, "That member is not currently online.");
+			const targetState = targetConnection.state as ChatConnectionState;
+			const entranceConfig = targetState.entrance as any;
+			if (!entranceConfig?.tier || entranceConfig.tier === "none" || !entranceConfig?.config?.enabled) return this.sendError(connection, "That member does not have an active entrance.");
+			this.broadcast(JSON.stringify({
+				type: "entrance",
+				username: this.publicName(targetState),
+				entrance: entranceConfig,
 				actor: this.publicName(state),
 				at: Date.now()
 			}));
@@ -2490,6 +2534,19 @@ export default {
 					forwarded.headers.set("x-chat-role", authData.user.role || "user");
 					if (authData.user.chat_name_color) forwarded.headers.set("x-chat-name-color", authData.user.chat_name_color);
 					if (authData.user.chat_badge) forwarded.headers.set("x-chat-badge", authData.user.chat_badge);
+
+					try {
+						const profileResponse = await env.AUTH.fetch(
+							new Request(`https://chatroom.internal/profile?username=${encodeURIComponent(authData.user.username)}`, {
+								method: "GET",
+								headers: { Authorization: `Bearer ${token}` },
+							}),
+						);
+						if (profileResponse.ok) {
+							const profileData = await profileResponse.json() as { entrance?: unknown };
+							if (profileData.entrance) forwarded.headers.set("x-chat-entrance", encodeURIComponent(JSON.stringify(profileData.entrance)));
+						}
+					} catch {}
 					return forwarded;
 				},
 			},
