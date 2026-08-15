@@ -221,6 +221,7 @@ type ClientMessage =
 	| { type: "admin_confetti" }
 	| { type: "admin_effect"; effect?: string; target?: string | null; message?: string | null }
 	| { type: "admin_trigger_entrance"; username?: string }
+	| { type: "sync_entrance"; username?: string }
 	| { type: "admin_identity"; hideAdminBadge?: boolean; maskName?: string | null }
 	| { type: "staff_user_color"; username?: string; nameColor?: string | null }
 	| { type: "game_start"; game?: "hangman" | "boss" | "werewolf" | "rps_tournament"; phrase?: string; boss?: BossKey }
@@ -768,6 +769,25 @@ export class Chat extends Server<Env> {
 		const ctx = this.ctx as unknown as { waitUntil?: (value: Promise<unknown>) => void };
 		if (ctx.waitUntil) ctx.waitUntil(promise.catch(() => undefined));
 		else void promise.catch(() => undefined);
+	}
+
+	async currentEntranceSnapshot(username: string) {
+		try {
+			const response = await this.env.AUTH.fetch(new Request(`https://chatroom.internal/internal/entrance?username=${encodeURIComponent(username)}`));
+			if (!response.ok) return null;
+			const data = await response.json() as { ok?: boolean; entrance?: Record<string, unknown> | null };
+			return data.ok && data.entrance ? data.entrance : null;
+		} catch {
+			return null;
+		}
+	}
+
+	setLiveEntranceSnapshot(username: string, entrance: Record<string, unknown> | null) {
+		for (const other of this.getConnections<ChatConnectionState>()) {
+			const otherState = other.state as ChatConnectionState | null;
+			if (!otherState || otherState.username.toLowerCase() !== username.toLowerCase()) continue;
+			other.setState({ ...otherState, entrance });
+		}
 	}
 
 
@@ -2066,6 +2086,17 @@ export class Chat extends Server<Env> {
 			return;
 		}
 
+		if (parsed.type === "sync_entrance") {
+			const requested = String(parsed.username || state.username).trim();
+			if (!requested) return;
+			if (requested.toLowerCase() !== state.username.toLowerCase() && !this.isAdmin(state)) return this.adminError(connection);
+			this.runBackground((async () => {
+				const fresh = await this.currentEntranceSnapshot(requested);
+				if (fresh) this.setLiveEntranceSnapshot(requested, fresh);
+			})());
+			return;
+		}
+
 		if (parsed.type === "admin_trigger_entrance") {
 			if (!this.isAdmin(state)) return this.adminError(connection);
 			const requested = String(parsed.username || "").trim();
@@ -2077,15 +2108,22 @@ export class Chat extends Server<Env> {
 			});
 			if (!targetConnection?.state) return this.sendError(connection, "That member is not currently online.");
 			const targetState = targetConnection.state as ChatConnectionState;
-			const entranceConfig = targetState.entrance as any;
-			if (!entranceConfig?.tier || entranceConfig.tier === "none" || !entranceConfig?.config?.enabled) return this.sendError(connection, "That member does not have an active entrance.");
-			this.broadcast(JSON.stringify({
-				type: "entrance",
-				username: this.publicName(targetState),
-				entrance: entranceConfig,
-				actor: this.publicName(state),
-				at: Date.now()
-			}));
+			this.runBackground((async () => {
+				const fresh = await this.currentEntranceSnapshot(targetState.username);
+				const entranceConfig = (fresh || targetState.entrance) as any;
+				if (!entranceConfig?.tier || entranceConfig.tier === "none" || !entranceConfig?.config?.enabled) {
+					this.sendError(connection, "That member does not have an active entrance.");
+					return;
+				}
+				if (fresh) this.setLiveEntranceSnapshot(targetState.username, fresh);
+				this.broadcast(JSON.stringify({
+					type: "entrance",
+					username: this.publicName(targetState),
+					entrance: entranceConfig,
+					actor: this.publicName(state),
+					at: Date.now()
+				}));
+			})());
 			return;
 		}
 
